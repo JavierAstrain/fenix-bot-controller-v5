@@ -840,6 +840,130 @@ def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str
     }
     return out, meta
 
+# ---------- Especial: facturas por pagar / vencimientos ----------
+def _detect_invoice_id_col(df: pd.DataFrame) -> Optional[str]:
+    cand = []
+    for c in df.columns:
+        cn = _norm(c)
+        if any(k in cn for k in ["factura","n°","nº","nro","numero","número","folio","documento","doc","comprobante"]):
+            cand.append(c)
+    if cand:
+        # choose the one with highest nunique
+        cand.sort(key=lambda c: int(pd.Series(df[c]).nunique(dropna=True)), reverse=True)
+        return cand[0]
+    # fallback: any 'id' role
+    try:
+        roles = detect_roles_for_sheet(df, "")
+        for c,r in roles.items():
+            if r=="id":
+                return c
+    except Exception:
+        pass
+    return None
+
+def _detect_money_col(df: pd.DataFrame) -> Optional[str]:
+    # prefer roles 'money'
+    try:
+        roles = detect_roles_for_sheet(df, "")
+        money = [c for c,r in roles.items() if r=="money"]
+        if money: return money[0]
+    except Exception:
+        pass
+    # fallback by name
+    for c in df.columns:
+        cn = _norm(c)
+        if any(k in cn for k in ["monto","total","neto","importe","valor","bruto","pagar"]):
+            return c
+    return None
+
+def _detect_due_col(df: pd.DataFrame) -> Optional[str]:
+    # prefer vencimiento/pago names
+    for c in df.columns:
+        cn = _norm(c)
+        if any(k in cn for k in ["venc","vcto","vto","vencim","fecha pago","fecha de pago","pago"]):
+            return c
+    # else try any column name containing 'fecha' or that is date-like
+    for c in df.columns:
+        cn = _norm(c)
+        if "fecha" in cn or _likely_date_series(df[c]):
+            return c
+    return None
+
+def compute_due_invoices_if_applicable(data: Dict[str, pd.DataFrame], question: str):
+    q = _norm(question or "")
+    pay_intent = any(w in q for w in [
+        "pagar","pago","pagos","por pagar","pendiente","pendientes",
+        "venc","vence","vencen","vencimiento","vcto","vto","venc.","por vencer"
+    ])
+    future_intent = any(w in q for w in ["proxim", "siguiente", "esta semana", "este mes"])
+    if not (pay_intent or future_intent):
+        return None  # not our path
+
+    rng = extract_date_range_from_question_es(question or "") or {}
+    now = _now_scl().normalize()
+    if rng:
+        start = pd.Timestamp(rng.get("start", now)).normalize()
+        end   = pd.Timestamp(rng.get("end", now)).normalize()
+    else:
+        # default window: próximos 7 días si no hay rango
+        start, end = now, now + pd.Timedelta(days=6)
+
+    # Para "próximos": nunca incluir pasado
+    if start < now:
+        start = now
+
+    rows = []
+    used = {}
+    total = 0.0
+    for h, df in (data or {}).items():
+        if df is None or df.empty: 
+            continue
+        idc = _detect_invoice_id_col(df)
+        valc = _detect_money_col(df)
+        duec = _detect_due_col(df)
+        if not duec:
+            continue
+        dt = pd.to_datetime(df[duec], errors="coerce", dayfirst=True)
+        mask = (dt >= start) & (dt <= (end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
+        sub = df.loc[mask].copy()
+        if len(sub)==0:
+            continue
+        used[h] = {"due_col": duec, "id_col": idc, "val_col": valc}
+        if idc is None:
+            # create a synthetic ID
+            id_series = sub.index.astype(str)
+        else:
+            id_series = sub[idc].astype(str)
+        if valc:
+            val_series = pd.to_numeric(sub[valc], errors="coerce").fillna(0.0)
+        else:
+            val_series = pd.Series([0.0]*len(sub), index=sub.index)
+        # cliente/proveedor opcional
+        cli = None
+        for c in sub.columns:
+            cn = _norm(c)
+            if "cliente" in cn or "proveedor" in cn:
+                cli = c; break
+        client_series = sub[cli].astype(str) if cli else pd.Series([""]*len(sub), index=sub.index)
+        for i,(fid, amount, ddate, cli_val) in enumerate(zip(id_series, val_series, dt.loc[mask], client_series)):
+            rows.append({"HOJA": h, "FACTURA": fid, "MONTO": float(amount), "FECHA": pd.Timestamp(ddate).date(), "CLIENTE": cli_val})
+
+    if not rows:
+        return {"ok": True, "category_col": "FACTURA", "value_col": "MONTO", "value_role": "money",
+                "op":"sum", "rows": 0, "total": 0.0, "by_category": [],
+                "df_result": pd.DataFrame({"CATEGORIA": [], "VALOR": []})}
+
+    df_all = pd.DataFrame(rows)
+    # Agregado por factura para el gráfico; pero mantendremos tabla detallada aparte si la UI la muestra
+    agg = df_all.groupby("FACTURA", dropna=False)["MONTO"].sum().sort_values(ascending=False)
+    by_cat = [{"categoria": str(k), "valor": float(v)} for k,v in agg.items()]
+    df_res = agg.reset_index().rename(columns={"FACTURA":"CATEGORIA", "MONTO":"VALOR"})
+    total = float(agg.sum())
+
+    return {"ok": True, "category_col": "FACTURA", "value_col": "MONTO", "value_role": "money",
+            "op":"sum", "rows": int(len(df_all)), "total": total, "by_category": by_cat,
+            "df_result": df_res}
+
 
 QTY_PAT  = re.compile(r'(?i)(cantidad|unidades|servicios|items|piezas|qty|cant)')
 CAT_HINT = re.compile(r'(?i)(tipo|clase|categoria|estado|proceso|servicio|cliente|patente|sucursal|marca|modelo|vehiculo|vehículo)')
@@ -1969,8 +2093,12 @@ elif ss.menu_sel == "Consulta IA":
         if responder_click and pregunta:
             data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
             schema = _build_schema(data_filt)
-            plan_c = plan_compute_from_llm(pregunta, schema)
-            facts = execute_compute(plan_c, data_filt)
+            facts_special = compute_due_invoices_if_applicable(data, pregunta)
+            if facts_special is not None:
+                facts = facts_special
+            else:
+                plan_c = plan_compute_from_llm(pregunta, schema)
+                facts = execute_compute(plan_c, data_filt)
 
             if not facts.get("ok"):
                 with left:
@@ -2082,6 +2210,7 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
 
 
 
