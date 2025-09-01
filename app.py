@@ -696,6 +696,14 @@ def _choose_date_col(df: pd.DataFrame, roles: Dict[str,str], question: str) -> s
     for c in date_cols:
         cn = _norm(c)
         score = 0
+        # prioridad por tipo de fecha en función de la pregunta
+        if any(w in q for w in ["pagar","pago","pagos","por pagar","pendiente","pendientes",
+                                 "venc","vence","vencen","vencimiento","vcto","vto","venc."]):
+            if ("venc" in cn) or ("vcto" in cn) or ("vto" in cn):
+                score += 10  # fecha de vencimiento
+            if "pago" in cn:
+                score += 8   # fecha de pago programado
+        # señales genéricas
         if "emision" in cn or "emisión" in cn: score += 3
         if "ingreso" in cn or "recep" in cn:    score += 2
         if "salida" in cn or "entrega" in cn:   score += 2
@@ -1977,5 +1985,6 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
 
 
