@@ -295,51 +295,6 @@ def load_gsheet(json_keyfile: str, sheet_url: str):
     sheet = client.open_by_url(sheet_url)
     return {ws.title: pd.DataFrame(ws.get_all_records()) for ws in sheet.worksheets()}
 
-
-# ======== Diccionario de roles (hoja "DICCIONARIO") ========
-def apply_diccionario_roles_if_exists(data: Dict[str, pd.DataFrame]) -> None:
-    """
-    Lee la hoja DICCIONARIO (si existe) con columnas esperadas:
-    - hoja | columna | rol | descripcion (opcional)
-    y la aplica a ss.roles_forced como { (hoja_norm, col_norm): rol_norm }.
-    """
-    try:
-        if not data: 
-            return
-        # Buscar hoja por nombre (insensible a mayúsculas/acentos)
-        target = None
-        for h in list(data.keys()):
-            if _norm(h) in ("diccionario", "dictionary", "dicc", "diccionario de datos"):
-                target = h; break
-        if not target:
-            return
-        df = data[target]
-        if df is None or df.empty:
-            return
-        # Normalizar nombres de columnas
-        cols = { _norm(c):c for c in df.columns }
-        def _col(*names):
-            for n in names:
-                if n in cols: return cols[n]
-            return None
-        hcol = _col("hoja","sheet","tabla")
-        ccol = _col("columna","col","campo")
-        rcol = _col("rol","role")
-        # descripcion no es obligatorio
-        if not (hcol and ccol and rcol):
-            return
-        roles_map = {}
-        for _,row in df.iterrows():
-            hoja = _norm(row.get(hcol,""))
-            col  = _norm(row.get(ccol,""))
-            rol  = _norm(row.get(rcol,""))
-            if hoja and col and rol:
-                roles_map[(hoja, col)] = rol
-        # Actualiza session_state
-        if roles_map:
-            ss.roles_forced.update(roles_map)
-    except Exception as e:
-        st.warning(f"No se pudo aplicar DICCIONARIO: {e}")
 # ======== OpenAI ========
 def _get_openai_client():
     api_key = (st.secrets.get("OPENAI_API_KEY") or st.secrets.get("openai_api_key") or
@@ -1602,72 +1557,6 @@ def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
             continue
     return {"ok": False, "msg": last_err or "No se pudo calcular."}
 
-
-def fallback_compute(question: str, data: Dict[str, pd.DataFrame]) -> Dict[str, Any] | None:
-    """Heurísticas para preguntas típicas sin depender del LLM.
-    Soporta: facturas pendientes, entregas futuras, atrasos.
-    Devuelve un objeto 'facts' compatible con execute_compute cuando procede.
-    """
-    q = _norm(question)
-    now = _now_scl().normalize()
-
-    def _find_candidate(cols, hints):
-        for c in cols:
-            cn = _norm(c)
-            if any(h in cn for h in hints):
-                return c
-        return None
-
-    # 1) Facturas pendientes (fecha de pago > hoy)
-    if any(k in q for k in ["factura pend", "pago pendiente", "pendiente de pago", "facturas por pagar"]):
-        for h, df in data.items():
-            if df is None or df.empty: continue
-            roles = detect_roles_for_sheet(df, h)
-            # Busca fecha de pago y el ID
-            date_cols = [c for c,r in roles.items() if r=="date"]
-            id_cols = [c for c,r in roles.items() if r=="id"]
-            pago_col = _find_candidate(date_cols, ["pago", "venc", "vencim", "pagar"])
-            id_col = id_cols[0] if id_cols else None
-            if not (pago_col and id_col): continue
-            dt = pd.to_datetime(df[pago_col], errors="coerce")
-            dff = df[dt.dt.normalize() > now].copy()
-            if dff.empty: 
-                continue
-            srs = dff[id_col].astype(str).value_counts()
-            df_res = srs.reset_index()
-            df_res.columns = ["CATEGORIA", "VALOR"]
-            by_cat = [{"categoria": str(k), "valor": int(v)} for k,v in srs.items()]
-            return {"ok": True, "sheet": h, "value_col": id_col, "category_col": id_col, "op": "count",
-                    "rows": int(len(dff)), "total": int(srs.sum()), "by_category": by_cat,
-                    "value_role": "quantity", "df_result": df_res}
-
-    # 2) Entregas futuras (fecha entrega > hoy) o atrasos (entrega < hoy)
-    if any(k in q for k in ["entrega futura", "entregas futuras", "por entregar", "pendientes de entrega", "no entregadas"])       or any(k in q for k in ["atraso", "atrasadas", "retraso", "retrasadas"]):
-        buscar_atraso = any(k in q for k in ["atraso", "atrasadas", "retraso", "retrasadas"])
-        for h, df in data.items():
-            if df is None or df.empty: continue
-            roles = detect_roles_for_sheet(df, h)
-            date_cols = [c for c,r in roles.items() if r=="date"]
-            id_cols = [c for c,r in roles.items() if r=="id"]
-            entrega_col = _find_candidate(date_cols, ["entrega", "salida", "egreso"])
-            id_col = id_cols[0] if id_cols else None
-            if not (entrega_col and id_col): continue
-            dt = pd.to_datetime(df[entrega_col], errors="coerce")
-            if buscar_atraso:
-                dff = df[dt.dt.normalize() < now].copy()
-            else:
-                dff = df[dt.dt.normalize() > now].copy()
-            if dff.empty:
-                continue
-            srs = dff[id_col].astype(str).value_counts()
-            df_res = srs.reset_index()
-            df_res.columns = ["CATEGORIA", "VALOR"]
-            by_cat = [{"categoria": str(k), "valor": int(v)} for k,v in srs.items()]
-            label = "atraso" if buscar_atraso else "entrega futura"
-            return {"ok": True, "sheet": h, "value_col": id_col, "category_col": id_col, "op": "count",
-                    "rows": int(len(dff)), "total": int(srs.sum()), "by_category": by_cat,
-                    "value_role": "quantity", "df_result": df_res}
-    return None
 def build_verified_summary(facts: dict) -> str:
     val = facts.get("value_col","valor")
     cat = facts.get("category_col","")
@@ -1825,7 +1714,6 @@ if ss.menu_sel == "Datos":
         file = st.file_uploader("Sube un Excel", type=["xlsx","xls"])
         if file:
             ss.data = load_excel(file)
-            apply_diccionario_roles_if_exists(ss.data)
             st.success("Excel cargado.")
     else:
         with st.form(key="form_gsheet"):
@@ -1834,7 +1722,6 @@ if ss.menu_sel == "Datos":
         if conectar and url:
             try:
                 ss.data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
-                apply_diccionario_roles_if_exists(ss.data)
                 ss.sheet_url = url
                 st.success("Google Sheet conectado.")
             except Exception as e:
@@ -1898,7 +1785,7 @@ elif ss.menu_sel == "Consulta IA":
                 render_ia_html_block(prettify_answer(raw) + "\n\n" + texto_extra, height=520)
                 _u = st.session_state.get('_last_usage')
                 if _u:
-                    st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                    st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
             with right:
                 render_finance_table(data)
                 st.markdown("### Distribución por cliente y procesos")
@@ -1976,21 +1863,9 @@ elif ss.menu_sel == "Consulta IA":
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
             data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
-                        # Muestra info del filtro si se aplicó
-            try:
-                if _date_meta.get("applied"):
-                    st.caption(f"🔎 Filtro por fechas aplicado: {_date_meta.get('start')} → {_date_meta.get('end')}")
-            except Exception:
-                pass
-schema = _build_schema(data_filt)
+            schema = _build_schema(data_filt)
             plan_c = plan_compute_from_llm(pregunta, schema)
             facts = execute_compute(plan_c, data_filt)
-            # Fallback heurístico para preguntas típicas si el plan falla o el resultado es vacío
-            if not facts.get('ok') or (facts.get('rows',0)==0 and (facts.get('total') in (0,None))):
-                fb = fallback_compute(pregunta, data_filt)
-                if fb:
-                    facts = fb
-
 
             if not facts.get("ok"):
                 with left:
@@ -2000,7 +1875,7 @@ schema = _build_schema(data_filt)
                     render_ia_html_block(raw, height=620)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                        st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
                 with right:
                     ok = False
                     try:
@@ -2017,7 +1892,7 @@ schema = _build_schema(data_filt)
                     render_ia_html_block(texto_left, height=520)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                        st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
                 with right:
                     df_res = facts["df_result"]
                     if facts.get("category_col"):
@@ -2033,25 +1908,8 @@ schema = _build_schema(data_filt)
                                 # para conteos o no-moneda, uso tablas si está muy largo
                                 st.info("Distribución desbalanceada: muestro tabla para mejor lectura." if len(df_res)>15 else "")
                                 df_show = df_res.rename(columns={facts["category_col"]:"Categoría","VALOR":"Valor"}).copy()
-                                # Normaliza columnas esperadas
-                                if "Valor" not in df_show.columns:
-                                    for alt in ["VALOR","__v","valor","value"]:
-                                        if alt in df_show.columns:
-                                            df_show.rename(columns={alt:"Valor"}, inplace=True)
-                                            break
-                                if "Categoría" not in df_show.columns:
-                                    for alt in ["CATEGORIA","Categoria","category","categoría"]:
-                                        if alt in df_show.columns:
-                                            df_show.rename(columns={alt:"Categoría"}, inplace=True)
-                                            break
-                                # Si sigue sin columna de Valor, intenta tomar la segunda columna
-                                if "Valor" not in df_show.columns and len(df_show.columns)>=2:
-                                    for c in df_show.columns:
-                                        if c != "Categoría":
-                                            df_show.rename(columns={c:"Valor"}, inplace=True)
-                                            break
                                 if facts.get("op","sum")=="count" or facts.get("value_role")!="money":
-                                    df_show["Valor"] = pd.to_numeric(df_show.get("Valor"), errors="coerce").fillna(0).round(0).astype(int)
+                                    df_show["Valor"] = df_show["Valor"].apply(lambda v: int(round(float(v))) if pd.notna(v) else 0)
                                 else:
                                     df_show["Valor"] = df_show["Valor"].apply(fmt_money)
                                 st.markdown("### 📋 Resultado")
@@ -2119,5 +1977,3 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
-
-
