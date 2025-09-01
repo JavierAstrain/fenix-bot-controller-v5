@@ -13,7 +13,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
-from analizador import HOY, build_role_index, entregas_status, facturas_pendientes, facturas_por_pagar_en_dias
 
 from analizador import analizar_datos_taller
 
