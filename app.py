@@ -714,9 +714,22 @@ def _choose_date_col(df: pd.DataFrame, roles: Dict[str,str], question: str) -> s
     priority.sort(reverse=True)
     return priority[0][1] if priority else date_cols[0]
 
+
+
+def _likely_date_series(s) -> bool:
+    try:
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        ratio = (dt.notna().sum() / max(len(dt), 1))
+        return ratio >= 0.4  # consider "date-like" if >=40% parseable
+    except Exception:
+        return False
+
+
 def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str):
     """
-    Si la pregunta contiene fechas o rangos, filtra TODAS las hojas por la mejor columna de fecha detectada.
+    Si la pregunta contiene fechas/rangos, filtra por una columna de fecha adecuada.
+    - Para consultas de pagos/vencimientos, prioriza columnas de vencimiento/pago aunque no estén marcadas como 'date'.
+    - Si el filtro deja 0 filas, intenta un segundo pase probando columnas fecha "probables".
     Devuelve (data_filtrada, meta_dict)
     """
     rng = extract_date_range_from_question_es(question or "")
@@ -725,24 +738,108 @@ def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str
 
     start = pd.Timestamp(rng["start"]).normalize()
     end   = pd.Timestamp(rng["end"]).normalize()
+
+    q = _norm(question or "")
+    pay_intent = any(w in q for w in [
+        "pagar","pago","pagos","por pagar","pendiente","pendientes",
+        "venc","vence","vencen","vencimiento","vcto","vto","venc."
+    ])
+
+    # prioridades para nombres de columnas de fecha cuando hay intención de pago
+    pay_priority = ["venc", "vcto", "vto", "vencim", "pago", "f. pago", "fpago", "fecha pago", "fecha de pago"]
+
+    def _order_candidates(cols, question_is_pay):
+        scored = []
+        for c in cols:
+            cn = _norm(c)
+            score = 0
+            if question_is_pay:
+                for i,kw in enumerate(pay_priority):
+                    if kw in cn:
+                        score += (100 - i)  # más a la izquierda, más peso
+            # reglas genéricas (mantener las existentes)
+            if "emision" in cn or "emisión" in cn: score += 3
+            if "ingreso" in cn or "recep" in cn:  score += 2
+            if "salida" in cn or "entrega" in cn: score += 2
+            scored.append((score, c))
+        scored.sort(reverse=True)
+        return [c for _,c in scored] if scored else cols
+
     out = {}
     used_cols = {}
+    any_rows = False
 
     for h, df in (data or {}).items():
         if df is None or df.empty:
             out[h] = df
             continue
+
         roles = detect_roles_for_sheet(df, h)
-        date_col = _choose_date_col(df, roles, question)
-        if not date_col:
+        date_cols = [c for c,r in roles.items() if r == "date"]
+
+        # Si no hay 'date' o es consulta de pagos, amplia candidatos con heurística por nombre/valores
+        extra_candidates = []
+        for c in df.columns:
+            cn = _norm(c)
+            # agrega si parece fecha por nombre o por valores
+            if (pay_intent and any(kw in cn for kw in pay_priority)) or ("fecha" in cn) or _likely_date_series(df[c]):
+                if c not in date_cols:
+                    extra_candidates.append(c)
+
+        candidates = list(dict.fromkeys(date_cols + extra_candidates))  # únicos y en orden
+        if pay_intent:
+            candidates = _order_candidates(candidates, True)
+        else:
+            candidates = _order_candidates(candidates, False)
+
+        chosen = None
+        dt = None
+        for c in candidates:
+            try:
+                tmp = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
+                if tmp.notna().sum() == 0:
+                    continue
+                chosen = c
+                dt = tmp
+                break
+            except Exception:
+                continue
+
+        if chosen is None:
             out[h] = df
             continue
-        dt = pd.to_datetime(df[date_col], errors="coerce")
-        mask = (dt >= start) & (dt <= (end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
-        out[h] = df[mask].copy()
-        used_cols[h] = date_col
 
-    return out, {"applied": True, "start": str(start.date()), "end": str(end.date()), "by_sheet": used_cols}
+        mask = (dt >= start) & (dt <= (end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
+        dff = df.loc[mask].copy()
+        out[h] = dff
+        used_cols[h] = chosen
+        if len(dff) > 0:
+            any_rows = True
+
+    # Si no quedó ninguna fila y la intención es pagos, intenta último fallback con cualquier columna que contenga 'venc'/'pago'
+    if not any_rows and pay_intent:
+        for h, df in (data or {}).items():
+            if df is None or df.empty:
+                continue
+            col = None
+            for c in df.columns:
+                cn = _norm(c)
+                if any(kw in cn for kw in pay_priority):
+                    col = c; break
+            if col:
+                dt = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
+                mask = (dt >= start) & (dt <= (end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
+                out[h] = df.loc[mask].copy()
+                used_cols[h] = col
+
+    meta = {
+        "applied": True,
+        "start": str(start.date()),
+        "end": str(end.date()),
+        "by_sheet": used_cols
+    }
+    return out, meta
+
 
 QTY_PAT  = re.compile(r'(?i)(cantidad|unidades|servicios|items|piezas|qty|cant)')
 CAT_HINT = re.compile(r'(?i)(tipo|clase|categoria|estado|proceso|servicio|cliente|patente|sucursal|marca|modelo|vehiculo|vehículo)')
