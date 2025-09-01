@@ -1,16 +1,16 @@
-# analizador.py — v5 (fechas robustas + compatibilidad total)
+# analizador.py — v6 (fechas robustas + atrasos y pendientes)
 import pandas as pd
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 _TZ = ZoneInfo("America/Santiago")
+HOY = datetime.now(_TZ).date()  # fecha actual del sistema
 
 def _norm(s: str) -> str:
     return str(s).strip().lower()
 
 def _to_local_datetime(s):
-    # parseo tolerante, day-first y zona horaria fija
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
     try:
         if getattr(dt.dt, "tz", None) is None:
@@ -19,7 +19,27 @@ def _to_local_datetime(s):
     except Exception:
         return dt
 
-# Pistas genéricas (sirve para planillas distintas)
+# -------------------------------
+# NUEVAS FUNCIONES DE FECHAS
+# -------------------------------
+def calcular_atrasos(df: pd.DataFrame, fecha_col: str) -> pd.DataFrame:
+    """Agrega columnas de atraso y estado en base a la fecha de entrega/pago."""
+    fechas = _to_local_datetime(df[fecha_col]).dt.date
+    df["_dias_atraso"] = (HOY - fechas).dt.days
+    df["_estado_fecha"] = df["_dias_atraso"].apply(
+        lambda d: "pendiente (futuro)" if d < 0 else ("cumplida" if d >= 0 else "sin fecha")
+    )
+    return df
+
+def facturas_pendientes(df: pd.DataFrame, fecha_pago_col: str, id_col: str):
+    """Retorna IDs de facturas con fecha de pago > hoy."""
+    fechas = _to_local_datetime(df[fecha_pago_col]).dt.date
+    pendientes = df[fechas > HOY]
+    return pendientes[id_col].astype(str).tolist()
+
+# -------------------------------
+# FUNCIONES EXISTENTES (ajustadas)
+# -------------------------------
 ING_HINTS = ["monto", "neto", "total", "importe", "facturacion", "facturación", "ingreso", "venta", "principal"]
 COST_HINTS = [
     "costo", "costos", "gasto", "gastos", "insumo", "insumos",
@@ -40,13 +60,11 @@ def _find_numeric_cols(df: pd.DataFrame, keywords):
     return cols
 
 def _count_services(df: pd.DataFrame) -> int:
-    # heurística por identificadores frecuentes
     keys = ["patente", "orden", "oc", "folio", "documento", "presupuesto", "id", "nro", "número", "num"]
     for k in keys:
         for c in df.columns:
             if k in _norm(c):
                 return int(df[c].nunique(dropna=True))
-    # fallback: filas con ingreso > 0
     ing_cols = _find_numeric_cols(df, ING_HINTS)
     if ing_cols:
         s = pd.to_numeric(df[ing_cols[0]], errors="coerce")
@@ -54,7 +72,6 @@ def _count_services(df: pd.DataFrame) -> int:
     return 0
 
 def _lead_time_days(df: pd.DataFrame):
-    # si existen 2 fechas típicas (ingreso/salida), reporta mediana en días (tz America/Santiago)
     start_keys = ["fecha ingreso", "ingreso", "recepcion", "recepción", "entrada"]
     end_keys   = ["fecha salida", "salida", "entrega", "egreso", "termino", "término"]
     start_col = end_col = None
@@ -85,23 +102,11 @@ def _apply_client_filter(df: pd.DataFrame, client_substr: str) -> pd.DataFrame:
     return df
 
 def analizar_datos_taller(data: Dict[str, pd.DataFrame], cliente_contiene: str = "") -> Dict[str, Any]:
-    """
-    KPIs genéricos multi-hoja (sin rango de fechas a propósito: el filtrado temporal se hace en app.py
-    cuando el usuario lo pide en la pregunta):
-      - ingresos: suma de columnas numéricas con hints de ingreso (todas las hojas)
-      - costos:   suma de columnas numéricas con hints de costo (todas las hojas)
-      - margen y margen_pct
-      - servicios: heurística (ID/folio/patente) o filas con ingreso>0
-      - ticket_promedio = ingresos / servicios
-      - conversion_pct: heurístico si existe par de columnas compatibles
-      - lead_time_mediano_dias: si hay pares de fecha ingreso/salida
-    """
     total_ing = 0.0
     total_cost = 0.0
     total_services = 0
     conversion = None
     lead_time = None
-
     hojas = {}
 
     for hoja, df in data.items():
@@ -120,7 +125,6 @@ def analizar_datos_taller(data: Dict[str, pd.DataFrame], cliente_contiene: str =
         total_cost += cost_sum
         total_services += _count_services(df2)
 
-        # lead time por hoja (si aplica)
         lt = _lead_time_days(df2)
         if lt is not None:
             lead_time = lt
@@ -138,6 +142,7 @@ def analizar_datos_taller(data: Dict[str, pd.DataFrame], cliente_contiene: str =
     ticket = (total_ing / total_services) if total_services else None
 
     return {
+        "fecha_actual": HOY.strftime("%d/%m/%Y"),
         "ingresos": total_ing,
         "costos": total_cost,
         "margen": margen,
@@ -148,3 +153,4 @@ def analizar_datos_taller(data: Dict[str, pd.DataFrame], cliente_contiene: str =
         "lead_time_mediano_dias": lead_time,
         "hojas": hojas
     }
+
