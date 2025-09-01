@@ -13,7 +13,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
-from analizador import HOY, build_role_index, entregas_status, facturas_pendientes
 
 from analizador import analizar_datos_taller
 
@@ -351,6 +350,7 @@ def ask_gpt(messages, model: str = "gpt-4o", temperature: float = 0.15, max_toke
 
 # ======== Token usage (persistente local) ========
 from pathlib import Path as _Path
+from analizador import HOY, build_role_index, entregas_status, facturas_pendientes
 _TOK_LOG = _Path(".tokens_usage.jsonl")
 
 def _log_tokens_persist(info: dict):
@@ -1978,3 +1978,97 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
+# --- Helper seguro para tablas de valor ---
+def _ensure_value_table(df, cat_col, val_col):
+    import pandas as _pd
+    if df is None or len(getattr(df, 'index', [])) == 0:
+        return _pd.DataFrame(columns=["Categoría","Valor"])
+    return _pd.DataFrame({
+        "Categoría": df[cat_col].astype(str),
+        "Valor": _pd.to_numeric(df[val_col], errors="coerce").fillna(0.0)
+    })
+
+
+# --- Construcción segura de índice de roles desde DICCIONARIO ---
+try:
+    _data_ref = None
+    if 'data' in globals():
+        _data_ref = data
+    if _data_ref is None and 'st' in globals():
+        _data_ref = st.session_state.get('data')
+    _dic = None
+    if _data_ref and isinstance(_data_ref, dict):
+        _dic = _data_ref.get('DICCIONARIO')
+    if _dic is None and 'st' in globals():
+        _dic = st.session_state.get('diccionario')
+    role_idx = build_role_index(_dic) if _dic is not None else {}
+    # marcar
+    # __ROLE_INDEX_BUILT__
+except Exception as _e:
+    role_idx = {}
+
+
+# --- Fallback determinístico para consultas de fecha ---
+def _fallback_consultas_fecha(pregunta, _data=None, _role_idx=None):
+    import streamlit as _st, pandas as _pd
+    if not pregunta:
+        return False
+    q = str(pregunta).lower()
+    # Selección de data
+    if _data is None:
+        _data = globals().get('data') or _st.session_state.get('data')
+    if _role_idx is None:
+        _role_idx = globals().get('role_idx') or _st.session_state.get('role_idx', {})
+    if _data is None or not isinstance(_data, dict) or len(_data)==0:
+        return False
+
+    handled = False
+
+    if "pendiente" in q and "factur" in q:
+        df = facturas_pendientes(_data, _role_idx)
+        _st.markdown("### Facturas pendientes de pago")
+        if df is None or df.empty:
+            _st.info("No se encontraron facturas pendientes de pago (fecha de pago > hoy).")
+        else:
+            df = df.sort_values("fecha_pago")
+            df["fecha_pago"] = _pd.to_datetime(df["fecha_pago"]).dt.strftime("%d/%m/%Y")
+            _st.dataframe(df, use_container_width=True, hide_index=True)
+            _st.caption(f"Total pendientes: {len(df)}")
+        handled = True
+
+    elif "entrega" in q and ("futura" in q or "futuras" in q):
+        df = entregas_status(_data, _role_idx)
+        df = df[df["estado"].str.contains("pendiente", na=False)]
+        _st.markdown("### Entregas futuras")
+        if df is None or df.empty:
+            _st.info("No hay entregas futuras registradas.")
+        else:
+            df["fecha_entrega"] = _pd.to_datetime(df["fecha_entrega"]).dt.strftime("%d/%m/%Y")
+            _st.dataframe(df.sort_values("fecha_entrega"), use_container_width=True, hide_index=True)
+            _st.caption(f"Total futuras: {len(df)}")
+        handled = True
+
+    elif "entrega" in q and ("atras" in q or "atrasadas" in q):
+        df = entregas_status(_data, _role_idx)
+        df = df[(df["dias_atraso"] >= 0) & (~df["dias_atraso"].isna())]
+        _st.markdown("### Entregas atrasadas / cumplidas")
+        if df is None or df.empty:
+            _st.info("No hay entregas atrasadas/cumplidas.")
+        else:
+            df["fecha_entrega"] = _pd.to_datetime(df["fecha_entrega"]).dt.strftime("%d/%m/%Y")
+            _st.dataframe(df.sort_values("dias_atraso", ascending=False), use_container_width=True, hide_index=True)
+            _st.caption(f"Total: {len(df)}")
+        handled = True
+
+    return handled
+
+
+# --- Hook automático: si existe variable 'pregunta', intentamos resolver con fallbacks ---
+try:
+    if 'pregunta' in globals():
+        if _fallback_consultas_fecha(pregunta):
+            pass
+except Exception as _eh:
+    pass
+
