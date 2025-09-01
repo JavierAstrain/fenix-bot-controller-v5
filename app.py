@@ -13,6 +13,9 @@ from typing import Dict, Any, List, Tuple, Optional
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
+from datetime import datetime
+from zoneinfo import ZoneInfo
+_TZ = ZoneInfo("America/Santiago") # Fija la zona horaria a Santiago
 
 from analizador import analizar_datos_taller
 
