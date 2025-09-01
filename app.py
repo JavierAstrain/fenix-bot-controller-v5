@@ -13,7 +13,10 @@ from typing import Dict, Any, List, Tuple, Optional
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
-from analizador import HOY, build_role_index, entregas_status, facturas_pendientes, facturas_por_pagar_en_dias
+from analizador import (
+    HOY, build_role_index, entregas_status, facturas_pendientes, facturas_por_pagar_en_dias,
+    entregados_no_facturados, en_taller_con_dias, entregas_proximos_dias_sin_factura, sin_aprobacion_presupuesto
+)
 
 
 from analizador import analizar_datos_taller
