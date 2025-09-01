@@ -14,6 +14,31 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
 
+def _likely_date_series(s) -> bool:
+    """
+    Heurística: considera una serie "tipo fecha" si al menos 40% de sus valores
+    se parsean como fecha día/mes/año.
+    """
+    try:
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        ratio = (dt.notna().sum() / max(len(dt), 1))
+        return ratio >= 0.4
+    except Exception:
+        return False
+
+def _to_date_series(obj) -> "pd.Series":
+    """
+    Devuelve una serie de objetos date (sin tz) desde cualquier columna.
+    Así evitamos comparaciones inválidas entre tz-aware y naive.
+    """
+    dt = pd.to_datetime(obj, errors="coerce", dayfirst=True)
+    try:
+        return dt.dt.date
+    except Exception:
+        # para datos ya tipo fecha/escalares
+        return pd.to_datetime(pd.Series(obj), errors="coerce", dayfirst=True).dt.date
+
+
 from analizador import analizar_datos_taller
 
 APP_BUILD = "build-2025-09-01-v5-dates"
