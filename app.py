@@ -3,6 +3,86 @@
 
 import streamlit as st
 import pandas as pd
+
+
+# ==== HOTFIX: compute_due_invoices_if_applicable defined early ====
+def compute_due_invoices_if_applicable(data: Dict[str, pd.DataFrame], question: str):
+    q = str(question or "").strip().lower()
+    intent = any(w in q for w in [
+        "pagar","pago","pagos","por pagar","pendiente","pendientes",
+        "venc","vence","vencen","vencimiento","vcto","vto","venc."
+    ])
+    if not intent:
+        return None
+
+    rng = extract_date_range_from_question_es(question or "")
+    if not rng:
+        now = _now_scl().normalize()
+        rng = {"start": now, "end": now + pd.Timedelta(days=6), "label": "próximos 7 días"}
+
+    s_date = rng["start"].date()
+    e_date = rng["end"].date()
+    today = _now_scl().date()
+    if ("proxim" in q or "siguient" in q or "por vencer" in q or "por pagar" in q) and s_date < today:
+        s_date = today
+
+    pay_priority = ["venc", "vcto", "vto", "vencim", "fecha pago", "f. pago", "fpago", "pago"]
+    id_priority  = ["factura", "n°", "nro", "numero", "número", "doc", "documento", "folio", "id"]
+    money_priority = ["monto", "total", "importe", "neto", "valor", "bruto"]
+
+    rows = []
+    for hoja, df in (data or {}).items():
+        if df is None or df.empty:
+            continue
+
+        # Columna fecha
+        cand_date = []
+        for c in df.columns:
+            cn = str(c).strip().lower()
+            if any(kw in cn for kw in pay_priority) or "fecha" in cn or _likely_date_series(df[c]):
+                cand_date.append(c)
+        if not cand_date:
+            continue
+        def _score_date(col):
+            cn = str(col).strip().lower(); score = 0
+            for i, kw in enumerate(pay_priority):
+                if kw in cn: score += (100 - i)
+            if "fecha" in cn: score += 1
+            return score
+        cand_date.sort(key=_score_date, reverse=True)
+        dcol = cand_date[0]
+        ds = _to_date_series(df[dcol])
+
+        # ID y monto
+        id_cols = [c for c in df.columns if any(kw in str(c).strip().lower() for kw in id_priority)]
+        id_col = id_cols[0] if id_cols else df.columns[0]
+        money_cols = [c for c in df.columns if any(kw in str(c).strip().lower() for kw in money_priority)]
+        mcol = money_cols[0] if money_cols else None
+
+        mask = (ds >= s_date) & (ds <= e_date)
+        if getattr(mask, "any")() and mask.any():
+            cols = [id_col] + ([mcol] if mcol else [])
+            sub = df.loc[mask, cols].copy()
+            sub.rename(columns={id_col:"FACTURA"}, inplace=True)
+            if mcol: sub.rename(columns={mcol:"MONTO"}, inplace=True)
+            sub["VENCIMIENTO"] = pd.to_datetime(pd.Series(list(ds[mask])), dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y")
+            sub["HOJA"] = hoja
+            if "MONTO" in sub.columns:
+                sub["MONTO"] = pd.to_numeric(sub["MONTO"], errors="coerce").fillna(0.0)
+            rows.append(sub)
+
+    if not rows:
+        return pd.DataFrame(columns=["FACTURA","VENCIMIENTO","MONTO","HOJA"])
+
+    out = pd.concat(rows, ignore_index=True)
+    try:
+        out["_v"] = pd.to_datetime(out["VENCIMIENTO"], dayfirst=True, errors="coerce")
+        out = out.sort_values("_v").drop(columns=["_v"])
+    except Exception:
+        pass
+    return out
+# ==== /HOTFIX ====
+
 # ====== FECHAS v5 (utilidades robustas) ======
 from zoneinfo import ZoneInfo
 _TZ = ZoneInfo("America/Santiago")
@@ -2034,5 +2114,4 @@ def compute_due_invoices_if_applicable(data: Dict[str, pd.DataFrame], question: 
     except Exception:
         pass
     return out
-
 
