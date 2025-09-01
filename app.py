@@ -1821,6 +1821,20 @@ elif ss.menu_sel == "Consulta IA":
 
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
+
+            # === Ruta especial: VENCIMIENTOS / FACTURAS POR PAGAR ===
+            _special = compute_due_invoices_if_applicable(data, pregunta)
+            if _special is not None:
+                with left:
+                    render_ia_html_block(_special["answer_md"], height=620)
+                with right:
+                    dfv = _special.get("viz_df")
+                    if dfv is not None and not dfv.empty:
+                        try:
+                            mostrar_tabla(dfv, col_categoria=_special["col_categoria"], col_valor=_special["col_valor"], titulo="Facturas por pagar")
+                        except Exception:
+                            st.dataframe(dfv)
+                st.stop()
             schema = _build_schema(data)
             plan_c = plan_compute_from_llm(pregunta, schema)
             facts = execute_compute(plan_c, data)
