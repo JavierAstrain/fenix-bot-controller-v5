@@ -613,18 +613,14 @@ def _parse_single_date_es(s: str) -> dict | None:
             return {"kind": "month", "start": start.normalize(), "end": end.normalize()}
     return None
 
+
 def extract_date_range_from_question_es(q: str) -> dict | None:
     """
     Extrae un rango de fechas [start, end] desde una pregunta en español (pasado y FUTURO).
-    Usa timezone America/Santiago. Soporta:
-      - "hoy", "ayer", "mañana"
-      - "esta semana", "semana pasada", "próxima semana"
-      - "este mes", "mes pasado", "próximo mes"
-      - "últimos N días/semanas/meses"
-      - "próximos N días/semanas/meses", y "en los próximos días" (N=7 por defecto)
-      - "entre dd/mm/aaaa y dd/mm/aaaa"
-      - "desde <mes> [año]"
-      - fechas sueltas "26/01/2025" (day-first)
+    Zona horaria: America/Santiago.
+    Soporta: hoy/ayer/mañana, esta/próxima/semana pasada, este/mes pasado/próximo mes,
+    últimos/próximos N días/semanas/meses, "en los próximos días", "entre dd/mm/aaaa y dd/mm/aaaa",
+    "desde <mes> [año]" y fechas sueltas dd/mm/aaaa.
     """
     import re
     import pandas as pd
@@ -632,101 +628,73 @@ def extract_date_range_from_question_es(q: str) -> dict | None:
     t = _norm(q or "")
     now = _now_scl().normalize()
 
-    def _sow(d):  # start of week (Mon)
-        return d - pd.Timedelta(days=int(d.weekday()))
-    def _eow(d):
-        return _sow(d) + pd.Timedelta(days=6)
-    def _som(d):  # start of month
-        return pd.Timestamp(year=int(d.year), month=int(d.month), day=1)
-    def _eom(d):
-        s = _som(d)
-        return (s + pd.offsets.MonthEnd(1)).normalize()
+    def _sow(d): return d - pd.Timedelta(days=int(d.weekday()))  # start of week (Mon)
+    def _eow(d): return _sow(d) + pd.Timedelta(days=6)
+    def _som(d): return pd.Timestamp(year=int(d.year), month=int(d.month), day=1)
+    def _eom(d): return (_som(d) + pd.offsets.MonthEnd(1)).normalize()
 
-    # palabras directas
-    if re.search(r'\\bhoy\\b', t):
-        return {"start": now, "end": now, "label": "hoy"}
-    if re.search(r'\\bayer\\b', t):
-        d = (now - pd.Timedelta(days=1)).normalize()
-        return {"start": d, "end": d, "label": "ayer"}
-    if re.search(r'\\bmañana\\b', t) or re.search(r'\\bmanana\\b', t):
-        d = (now + pd.Timedelta(days=1)).normalize()
-        return {"start": d, "end": d, "label": "mañana"}
+    # direct
+    if re.search(r'\bhoy\b', t):        return {"start": now, "end": now, "label": "hoy"}
+    if re.search(r'\bayer\b', t):       d = (now - pd.Timedelta(days=1)).normalize(); return {"start": d, "end": d, "label": "ayer"}
+    if re.search(r'\bmañana\b', t) or re.search(r'\bmanana\b', t):
+        d = (now + pd.Timedelta(days=1)).normalize(); return {"start": d, "end": d, "label": "mañana"}
 
     # semana
-    if re.search(r'\\besta\\s+semana\\b', t):
-        return {"start": _sow(now).normalize(), "end": _eow(now).normalize(), "label": "esta semana"}
-    if re.search(r'\\bsemana\\s+pasada\\b', t):
-        p = now - pd.Timedelta(weeks=1)
-        return {"start": _sow(p).normalize(), "end": _eow(p).normalize(), "label": "semana pasada"}
-    if re.search(r'\\bpr[oó]xima\\s+semana\\b', t):
-        n = now + pd.Timedelta(weeks=1)
-        return {"start": _sow(n).normalize(), "end": _eow(n).normalize(), "label": "próxima semana"}
+    if re.search(r'\besta\s+semana\b', t):   return {"start": _sow(now).normalize(), "end": _eow(now).normalize(), "label": "esta semana"}
+    if re.search(r'\bsemana\s+pasada\b', t): p = now - pd.Timedelta(weeks=1); return {"start": _sow(p).normalize(), "end": _eow(p).normalize(), "label": "semana pasada"}
+    if re.search(r'\bpr[oó]xima\s+semana\b', t): n = now + pd.Timedelta(weeks=1); return {"start": _sow(n).normalize(), "end": _eow(n).normalize(), "label": "próxima semana"}
 
     # mes
-    if re.search(r'\\beste\\s+mes\\b', t):
-        return {"start": _som(now).normalize(), "end": _eom(now).normalize(), "label": "este mes"}
-    if re.search(r'\\bmes\\s+pasado\\b', t):
+    if re.search(r'\beste\s+mes\b', t):      return {"start": _som(now).normalize(), "end": _eom(now).normalize(), "label": "este mes"}
+    if re.search(r'\bmes\s+pasado\b', t):
         first_this = _som(now)
         start = first_this - pd.tseries.offsets.MonthBegin(1)
-        end = first_this - pd.Timedelta(days=1)
+        end   = first_this - pd.Timedelta(days=1)
         return {"start": start.normalize(), "end": end.normalize(), "label": "mes pasado"}
-    if re.search(r'\\bpr[oó]ximo\\s+mes\\b', t):
+    if re.search(r'\bpr[oó]ximo\s+mes\b', t):
         n = now + pd.offsets.MonthBegin(1)
         s = pd.Timestamp(year=int(n.year), month=int(n.month), day=1)
         e = (s + pd.offsets.MonthEnd(1)).normalize()
         return {"start": s.normalize(), "end": e, "label": "próximo mes"}
 
-    # últimos N (pasado)
-    m = re.search(r'\\b[úu]ltim[oa]s?\\s+(\\d+)\\s+d[ií]as\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.Timedelta(days=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimos {n} días"}
-    m = re.search(r'\\b[úu]ltim[oa]s?\\s+(\\d+)\\s+semanas?\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.Timedelta(weeks=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimas {n} semanas"}
-    m = re.search(r'\\b[úu]ltim[oa]s?\\s+(\\d+)\\s+mes(?:es)?\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.offsets.DateOffset(months=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimos {n} meses"}
+    # últimos N
+    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+d[ií]as\b', t)
+    if m: n = int(m.group(1)); return {"start": (now - pd.Timedelta(days=n)).normalize(), "end": now.normalize(), "label": f"últimos {n} días"}
+    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+semanas?\b', t)
+    if m: n = int(m.group(1)); return {"start": (now - pd.Timedelta(weeks=n)).normalize(), "end": now.normalize(), "label": f"últimas {n} semanas"}
+    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+mes(?:es)?\b', t)
+    if m: n = int(m.group(1)); return {"start": (now - pd.offsets.DateOffset(months=n)).normalize(), "end": now.normalize(), "label": f"últimos {n} meses"}
 
-    # PRÓXIMOS N (futuro)
-    m = re.search(r'\\bpr[oó]xim[oa]s?\\s+(\\d+)\\s+d[ií]as\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(days=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximos {n} días"}
-    m = re.search(r'\\bpr[oó]xim[oa]s?\\s+(\\d+)\\s+semanas?\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(weeks=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximas {n} semanas"}
-    m = re.search(r'\\bpr[oó]xim[oa]s?\\s+(\\d+)\\s+mes(?:es)?\\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.offsets.DateOffset(months=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximos {n} meses"}
+    # próximos N
+    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as\b', t)
+    if m: n = int(m.group(1)); return {"start": (now + pd.Timedelta(days=1)).normalize(), "end": (now + pd.Timedelta(days=n)).normalize(), "label": f"próximos {n} días"}
+    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+semanas?\b', t)
+    if m: n = int(m.group(1)); return {"start": (now + pd.Timedelta(days=1)).normalize(), "end": (now + pd.Timedelta(weeks=n)).normalize(), "label": f"próximas {n} semanas"}
+    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+mes(?:es)?\b', t)
+    if m: n = int(m.group(1)); return {"start": (now + pd.Timedelta(days=1)).normalize(), "end": (now + pd.offsets.DateOffset(months=n)).normalize(), "label": f"próximos {n} meses"}
 
-    # "en los próximos días" (sin número) → 7 días
-    if re.search(r'\\b(en\\s+los\\s+)?pr[oó]xim[oa]s?\\s+d[ií]as\\b', t):
-        s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(days=7)).normalize()
-        return {"start": s, "end": e, "label": "próximos días"}
+    # "en los próximos días" (sin N) => 7
+    if re.search(r'\b(en\s+los\s+)?pr[oó]xim[oa]s?\s+d[ií]as\b', t):
+        return {"start": (now + pd.Timedelta(days=1)).normalize(), "end": (now + pd.Timedelta(days=7)).normalize(), "label": "próximos días"}
 
     # hasta/desde hoy
-    if re.search(r'\\bhasta\\s+hoy\\b', t):
+    if re.search(r'\bhasta\s+hoy\b', t):
         s = (now - pd.Timedelta(days=365)).normalize()
         return {"start": s, "end": now.normalize(), "label": "hasta hoy"}
-    if re.search(r'\\bdesde\\s+hoy\\b', t):
+    if re.search(r'\bdesde\s+hoy\b', t):
         return {"start": now.normalize(), "end": (now + pd.Timedelta(days=365)).normalize(), "label": "desde hoy"}
 
     # entre dd/mm/aaaa y dd/mm/aaaa
-    m = re.search(r'\\bentre\\s+([0-9/.\\-]+)\\s+y\\s+([0-9/.\\-]+)\\b', t)
+    m = re.search(r'\bentre\s+([0-9/.\-]+)\s+y\s+([0-9/.\-]+)\b', t)
     if m:
         s = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
         e = pd.to_datetime(m.group(2), dayfirst=True, errors="coerce")
         if pd.notna(s) and pd.notna(e):
             return {"start": s.normalize(), "end": e.normalize(), "label": f"entre {m.group(1)} y {m.group(2)}"}
 
-    # "desde <mes> [año]"
+    # desde <mes> [año]
     _ES_MONTHS = {"enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
-    m = re.search(r'\\bdesde\\s+([a-záéíóú]+)(?:\\s+de)?\\s*(\\d{4})?\\b', t)
+    m = re.search(r'\bdesde\s+([a-záéíóú]+)(?:\s+de)?\s*(\d{4})?\b', t)
     if m:
         mon = (m.group(1) or "").lower().replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
         y = int(m.group(2)) if m.group(2) else int(now.year)
@@ -735,8 +703,8 @@ def extract_date_range_from_question_es(q: str) -> dict | None:
             s = pd.Timestamp(year=y, month=mm, day=1)
             return {"start": s.normalize(), "end": now.normalize(), "label": f"desde {mon} {y}"}
 
-    # fecha suelta (día/mes/año)
-    m = re.search(r'(\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4})', t)
+    # fecha suelta dd/mm/aaaa
+    m = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', t)
     if m:
         s = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
         if pd.notna(s):
@@ -746,30 +714,47 @@ def extract_date_range_from_question_es(q: str) -> dict | None:
     return None
 
 
-def _choose_date_col(df: pd.DataFrame, roles: Dict[str,str], question: str) -> str | None:
-    # tries to pick the most relevant 'date' column based on hints present in the question
+
+def _choose_date_col(df: pd.DataFrame, roles: Dict[str, str], question: str) -> str | None:
+    """
+    Elige la mejor columna de tipo 'date' según pistas en la pregunta y el nombre de la columna.
+    Pistas extra: vencimiento/pago/due para consultas de facturas por pagar.
+    """
     q = _norm(question)
-    date_cols = [c for c,r in roles.items() if r == "date"]
+    date_cols = [c for c, r in roles.items() if r == "date"]
     if not date_cols:
         return None
+
     priority = []
     for c in date_cols:
         cn = _norm(c)
         score = 0
-if "emision" in cn or "emisión" in cn: score += 3
-if "ingreso" in cn or "recep" in cn:    score += 2
-if "salida" in cn or "entrega" in cn:   score += 2
-if "venc" in cn or "vencimiento" in cn or "pago" in cn or "due" in cn: score += 4
 
-if any(k in q for k in ["emision","emisión"]) and ("emision" in cn or "emisión" in cn): score += 4
-if "ingreso" in q and "ingreso" in cn: score += 4
-if "salida"  in q and "salida"  in cn: score += 4
-if any(k in q for k in ["venc","vencimiento","pago","pagar","due"]) and any(k in cn for k in ["venc","vencimiento","pago","due"]):
-    score += 6
+        # Hints en nombre de columna
+        if "emision" in cn or "emisión" in cn:
+            score += 3
+        if "ingreso" in cn or "recep" in cn:
+            score += 2
+        if "salida" in cn or "entrega" in cn:
+            score += 2
+        if "venc" in cn or "vencimiento" in cn or "pago" in cn or "due" in cn:
+            score += 4
 
-priority.append((score, c))
+        # Hints por la pregunta
+        if any(k in q for k in ["emision","emisión"]) and ("emision" in cn or "emisión" in cn):
+            score += 4
+        if "ingreso" in q and "ingreso" in cn:
+            score += 4
+        if "salida" in q and "salida" in cn:
+            score += 4
+        if any(k in q for k in ["venc","vencimiento","pago","pagar","due"]) and any(k in cn for k in ["venc","vencimiento","pago","due"]):
+            score += 6
+
+        priority.append((score, c))
+
     priority.sort(reverse=True)
     return priority[0][1] if priority else date_cols[0]
+
 
 def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str):
     """
