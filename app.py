@@ -3,6 +3,153 @@
 
 import streamlit as st
 import pandas as pd
+# ====== FECHAS v5 (utilidades robustas) ======
+from zoneinfo import ZoneInfo
+_TZ = ZoneInfo("America/Santiago")
+
+_ES_MONTHS = {
+    "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
+    "julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12
+}
+
+def _now_scl() -> pd.Timestamp:
+    try:
+        return pd.Timestamp.now(tz="America/Santiago")
+    except Exception:
+        return pd.Timestamp.now()
+
+def _likely_date_series(s) -> bool:
+    """True si >=40% de los valores se pueden parsear como fecha."""
+    try:
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        ratio = float(dt.notna().sum()) / max(len(dt), 1)
+        return ratio >= 0.40
+    except Exception:
+        return False
+
+def _to_date_series(obj) -> pd.Series:
+    """
+    Devuelve una Series de objetos datetime.date, tolerante a strings/mixtos.
+    Evita choques tz vs naive al comparar rangos.
+    """
+    dt = pd.to_datetime(obj, errors="coerce", dayfirst=True)
+    return dt.dt.date
+
+def _parse_any_date_es(s: str) -> dict | None:
+    """Soporta dd/mm/yyyy, 12 de agosto de 2025, agosto 2025, 2025."""
+    t = _norm(s) if " _norm" in globals() else str(s).strip().lower()
+    # dd/mm/yyyy, yyyy-mm-dd, etc.
+    for dayfirst in (True, False):
+        try:
+            dt = pd.to_datetime(t, errors="raise", dayfirst=dayfirst)
+            d = pd.Timestamp(dt.date())
+            return {"start": d, "end": d, "label": "día"}
+        except Exception:
+            pass
+    # "12 de agosto de 2025"
+    m = re.search(r'\b(\d{1,2})\s*(de\s*)?([a-záéíóú]+)\s*(de\s*)?(\d{4})\b', t)
+    if m:
+        d = int(m.group(1))
+        mon = m.group(3).translate(str.maketrans("áéíóú","aeiou"))
+        y = int(m.group(5))
+        mm = _ES_MONTHS.get(mon, None)
+        if mm:
+            start = pd.Timestamp(year=y, month=mm, day=d)
+            return {"start": pd.Timestamp(start.date()), "end": pd.Timestamp(start.date()), "label":"día"}
+    # "agosto 2025" o "2025 agosto"
+    m = re.search(r'\b([a-záéíóú]+)\s+(\d{4})\b', t) or re.search(r'\b(\d{4})\s+([a-záéíóú]+)\b', t)
+    if m:
+        if m.lastindex == 2 and m.group(1).isdigit():
+            y = int(m.group(1)); mon = m.group(2).translate(str.maketrans("áéíóú","aeiou"))
+        else:
+            mon = m.group(1).translate(str.maketrans("áéíóú","aeiou")); y = int(m.group(2))
+        mm = _ES_MONTHS.get(mon, None)
+        if mm:
+            start = pd.Timestamp(year=y, month=mm, day=1)
+            end = pd.Timestamp((start + pd.offsets.MonthEnd(1)).date())
+            return {"start": start, "end": end, "label":"mes"}
+    # "2025"
+    m = re.fullmatch(r'(19|20)\d{2}', t)
+    if m:
+        y = int(t)
+        return {"start": pd.Timestamp(f"{y}-01-01"), "end": pd.Timestamp(f"{y}-12-31"), "label":"año"}
+    return None
+
+def extract_date_range_from_question_es(q: str) -> dict | None:
+    """
+    Interpreta rangos en español y devuelve {"start": pd.Timestamp, "end": pd.Timestamp, "label": str}
+    - hoy / ayer / esta semana / este mes / este año
+    - próximos|siguientes N días (si omites N => 7)
+    - últimos N días/meses/años
+    - entre X y Y / del X al Y / desde X / hasta Y
+    - "enero 2025", "2025", "12 de agosto de 2025"
+    """
+    if not q:
+        return None
+    t = _norm(q) if " _norm" in globals() else str(q).strip().lower()
+    now = _now_scl().normalize()
+
+    # directos
+    if re.search(r'\bhoy\b', t):   return {"start": now, "end": now, "label":"hoy"}
+    if re.search(r'\bayer\b', t):  d = now - pd.Timedelta(days=1); return {"start": d, "end": d, "label":"ayer"}
+
+    # esta semana / este mes / este año
+    if "esta semana" in t:
+        d0 = now - pd.Timedelta(days=int(getattr(now, "dayofweek", 0)))
+        return {"start": d0, "end": d0 + pd.Timedelta(days=6), "label":"esta semana"}
+    if "este mes" in t:
+        d0 = now.replace(day=1); d1 = (d0 + pd.offsets.MonthEnd(1))
+        return {"start": d0, "end": pd.Timestamp(d1.date()), "label":"este mes"}
+    if ("este año" in t) or ("este anio" in t):
+        d0 = now.replace(month=1, day=1); d1 = now.replace(month=12, day=31)
+        return {"start": d0, "end": d1, "label":"este año"}
+
+    # PRÓXIMOS N días (solo futuro). Si no hay N => 7
+    m = re.search(r'\b(pr[oó]xim[oa]s?|siguientes)\s*(\d{1,3})?\s*d[ií]as\b', t)
+    if m:
+        n = int(m.group(2)) if m.group(2) else 7
+        start = now
+        end = now + pd.Timedelta(days=n-1)
+        return {"start": start, "end": end, "label": f"próximos {n} días"}
+
+    # ÚLTIMOS N días/meses/años (histórico)
+    m = re.search(r'\bultim[oa]s?\s+(\d{1,3})\s+(d[ií]as|meses|a[nñ]os?)\b', t)
+    if m:
+        n = int(m.group(1)); unit = m.group(2)
+        end = now
+        if "dia" in unit or "días" in unit or "dias" in unit:
+            start = end - pd.Timedelta(days=n-1)
+        elif "mes" in unit:
+            start = end - pd.DateOffset(months=n)
+        else:
+            start = end - pd.DateOffset(years=n)
+        return {"start": pd.Timestamp(start.date()), "end": pd.Timestamp(end.date()), "label": f"últimos {n} {unit}"}
+
+    # RANGOS explícitos
+    m = re.search(r'\bdel\s+(.+?)\s+al\s+(.+?)\b', t) or re.search(r'\bentre\s+(.+?)\s+y\s+(.+?)\b', t)
+    if m:
+        a, b = m.group(1), m.group(2)
+        d1 = _parse_any_date_es(a); d2 = _parse_any_date_es(b)
+        if d1 and d2:
+            s = d1["start"]; e = d2["end"]
+            if e < s: s, e = e, s
+            return {"start": s, "end": e, "label":"rango"}
+    m = re.search(r'\bdesde\s+(.+)$', t)
+    if m:
+        d1 = _parse_any_date_es(m.group(1)) or {"start": now}
+        return {"start": d1["start"], "end": now, "label": f"desde {m.group(1)}"}
+    m = re.search(r'\bhasta\s+(.+)$', t)
+    if m:
+        d2 = _parse_any_date_es(m.group(1)) or {"end": now}
+        return {"start": pd.Timestamp("1970-01-01"), "end": d2["end"], "label": f"hasta {m.group(1)}"}
+
+    # Mes o año sueltos
+    parsed = _parse_any_date_es(t)
+    if parsed:
+        return {"start": parsed["start"], "end": parsed["end"], "label": parsed["label"]}
+
+    return None
+# ====== /FECHAS v5 ======
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
@@ -14,34 +161,9 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
 
-def _likely_date_series(s) -> bool:
-    """
-    Heurística: considera una serie "tipo fecha" si al menos 40% de sus valores
-    se parsean como fecha día/mes/año.
-    """
-    try:
-        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-        ratio = (dt.notna().sum() / max(len(dt), 1))
-        return ratio >= 0.4
-    except Exception:
-        return False
-
-def _to_date_series(obj) -> "pd.Series":
-    """
-    Devuelve una serie de objetos date (sin tz) desde cualquier columna.
-    Así evitamos comparaciones inválidas entre tz-aware y naive.
-    """
-    dt = pd.to_datetime(obj, errors="coerce", dayfirst=True)
-    try:
-        return dt.dt.date
-    except Exception:
-        # para datos ya tipo fecha/escalares
-        return pd.to_datetime(pd.Series(obj), errors="coerce", dayfirst=True).dt.date
-
-
 from analizador import analizar_datos_taller
 
-APP_BUILD = "build-2025-09-01-v5-dates"
+APP_BUILD = "build-2025-09-01-v5-dates-final"
 FAVICON_PATH = st.secrets.get("FAVICON_PATH", "Isotipo_Nexa.png") or "Isotipo_Nexa.png"
 
 st.set_page_config(layout="wide", page_title="Controller Financiero IA", page_icon=FAVICON_PATH)
@@ -573,406 +695,6 @@ ID_PAT   = re.compile(r'(?i)\b(id|folio|factura|boleta|ot|orden|nro|n°|correlat
 MONEY_PAT= re.compile(r'(?i)(monto|valor|ingreso|ingresos|costo|costos|neto|bruto|precio|tarifa|pago|total|subtotal|margen|venta|ventas|compras)')
 PCT_PAT  = re.compile(r'(?i)(%|porcentaje|tasa|margen %|margen_pct|conversion)')
 DATE_PAT = re.compile(r'(?i)(fecha|emision|f_emision|periodo|mes|año|anio|fecha_factura|fecha_ot|fecha_ingreso|fecha_salida)')
-# ======== Fechas (parser ES) v5 ========
-def _now_scl():
-    try:
-        return pd.Timestamp.now(tz="America/Santiago")
-    except Exception:
-        return pd.Timestamp.now()
-
-_ES_MONTHS = {
-    "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
-    "julio":7, "agosto":8, "septiembre":9, "setiembre":9, "octubre":10,
-    "noviembre":11, "diciembre":12
-}
-
-def _eom(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(ts).normalize()
-    # end of month inclusive
-    return (ts + pd.tseries.offsets.MonthEnd(0)).normalize()
-
-def _som(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(ts).normalize()
-    return ts - pd.offsets.Day(ts.day - 1)
-
-def _parse_single_date_es(s: str) -> dict | None:
-    if not s: return None
-    t = _norm(s)
-    # Try standard numeric formats first
-    for dayfirst in (True, False):
-        try:
-            dt = pd.to_datetime(t, dayfirst=dayfirst, errors="raise")
-            return {"kind": "day", "start": pd.Timestamp(dt).normalize(), "end": pd.Timestamp(dt).normalize()}
-        except Exception:
-            pass
-    # "12 de agosto de 2025" / "12 agosto 2025"
-    m = re.search(r'\b(\d{1,2})\s*(de\s*)?([a-záéíóú]+)\s*(de\s*)?(\d{4})\b', t)
-    if m:
-        d = int(m.group(1))
-        mon = m.group(3).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(5))
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            try:
-                dt = pd.Timestamp(year=y, month=mm, day=d)
-                return {"kind": "day", "start": dt.normalize(), "end": dt.normalize()}
-            except Exception:
-                pass
-    # "agosto 2025" o "2025 agosto"
-    m = re.search(r'\b([a-záéíóú]+)\s+(\d{4})\b', t)
-    if not m:
-        m = re.search(r'\b(\d{4})\s+([a-záéíóú]+)\b', t)
-        if m:
-            mon = m.group(2).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-            y = int(m.group(1))
-        else:
-            mon = y = None
-    else:
-        mon = m.group(1).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(2))
-    if mon and y:
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            start = pd.Timestamp(year=y, month=mm, day=1)
-            end = _eom(start)
-            return {"kind": "month", "start": start.normalize(), "end": end.normalize()}
-    return None
-
-def extract_date_range_from_question_es(q: str) -> dict | None:
-    if not q: return None
-    t = _norm(q)
-    now = _now_scl().normalize()
-    # direct keywords
-    if re.search(r'\bhoy\b', t):
-        return {"start": now, "end": now, "label": "hoy"}
-    if re.search(r'\bayer\b', t):
-        d = now - pd.Timedelta(days=1)
-        return {"start": d, "end": d, "label": "ayer"}
-    if re.search(r'\bmañana\b', t) or re.search(r'\bmanana\b', t):
-        d = now + pd.Timedelta(days=1)
-        return {"start": d, "end": d, "label": "mañana"}
-
-    # este/ultimo mes, año
-    if re.search(r'\b(este|actual)\s+mes\b', t):
-        start = _som(now)
-        return {"start": start, "end": now, "label": "este mes"}
-    if re.search(r'\bmes\s+pasado\b', t):
-        first_this = _som(now)
-        start = first_this - pd.tseries.offsets.MonthBegin(1)
-        end = first_this - pd.Timedelta(days=1)
-        return {"start": start.normalize(), "end": end.normalize(), "label": "mes pasado"}
-    if re.search(r'\b(este|actual)\s+a(ñ|n)o\b', t):
-        start = pd.Timestamp(year=int(now.year), month=1, day=1)
-        return {"start": start, "end": now, "label": "este año"}
-    if re.search(r'\ba(ñ|n)o\s+pasado\b', t):
-        start = pd.Timestamp(year=int(now.year - 1), month=1, day=1)
-        end = pd.Timestamp(year=int(now.year - 1), month=12, day=31)
-        return {"start": start, "end": end, "label": "año pasado"}
-
-    # últimos N días/semanas/meses/años
-    m = re.search(r'\bultim[oa]s?\s+(\d{1,3})\s+(dias|días|semanas|meses|anos|años)\b', t)
-    if m:
-        n = int(m.group(1)); unit = m.group(2)
-        end = now
-        if 'dia' in unit or 'd\u00eda' in unit or 'días' in unit:
-            start = now - pd.Timedelta(days=n-1)
-        elif 'semana' in unit:
-            start = now - pd.Timedelta(weeks=n) + pd.Timedelta(days=1)
-        elif 'mes' in unit:
-            start = now - pd.DateOffset(months=n) + pd.Timedelta(days=1)
-        else:  # años
-            start = now - pd.DateOffset(years=n) + pd.Timedelta(days=1)
-        return {"start": start.normalize(), "end": end.normalize(), "label": f"últimos {n} {unit}"}
-
-    # rangos "del X al Y" / "entre X y Y"
-    m = re.search(r'\bdel\s+(.+?)\s+al\s+(.+?)\b', t)
-    if not m: m = re.search(r'\bentre\s+(.+?)\s+y\s+(.+?)\b', t)
-    if m:
-        a = _parse_single_date_es(m.group(1))
-        b = _parse_single_date_es(m.group(2))
-        if a and b:
-            return {"start": min(a["start"], b["start"]), "end": max(a["end"], b["end"]), "label": "rango"}
-
-    # mes / mes y año / fechas sueltas
-    # "desde enero (de 2025)"
-    m = re.search(r'\bdesde\s+([a-záéíóú]+)(?:\s+de)?\s*(\d{4})?\b', t)
-    if m:
-        mon = m.group(1).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(2)) if m.group(2) else int(now.year)
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            start = pd.Timestamp(year=y, month=mm, day=1)
-            return {"start": start.normalize(), "end": now, "label": f"desde {mon} {y}"}
-
-    # single explicit date or month-year
-    parsed = _parse_single_date_es(t)
-    if parsed:
-        return {"start": parsed["start"], "end": parsed["end"], "label": parsed["kind"]}
-
-    return None
-
-
-def compute_due_invoices_if_applicable(data: Dict[str, pd.DataFrame], question: str):
-    """
-    Si la pregunta habla de pagos/vencimientos y de un rango futuro (p.ej. "próximos X días"),
-    devuelve un dataframe consolidado con columnas: FACTURA (ID), VENCIMIENTO, MONTO, HOJA.
-    Si no aplica, devuelve None.
-    """
-    q = _norm(question or "")
-    intent = any(w in q for w in [
-        "pagar","pago","pagos","por pagar","pendiente","pendientes",
-        "venc","vence","vencen","vencimiento","vcto","vto","venc."
-    ])
-    if not intent:
-        return None
-
-    rng = extract_date_range_from_question_es(question or "")
-    if not rng:
-        # si no hay rango explícito y se trata de vencimientos, por defecto próximos 7 días
-        now = _now_scl().normalize()
-        rng = {"start": now, "end": now + pd.Timedelta(days=6), "label": "próximos 7 días"}
-
-    start = pd.Timestamp(rng["start"]).normalize()
-    end   = pd.Timestamp(rng["end"]).normalize()
-
-    pay_priority = ["venc", "vcto", "vto", "vencim", "fecha pago", "f. pago", "fpago", "pago"]
-    id_priority = ["factura", "n°", "nro", "numero", "número", "doc", "documento", "folio", "id"]
-    money_priority = ["monto", "total", "importe", "neto", "valor", "bruto"]
-
-    rows = []
-
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty:
-            continue
-
-        # --- elegir columna de fecha de vencimiento/pago ---
-        candidates_date = []
-        for c in df.columns:
-            cn = _norm(c)
-            if any(kw in cn for kw in pay_priority) or "fecha" in cn or _likely_date_series(df[c]):
-                candidates_date.append(c)
-        # orden por prioridad
-        def score_date(col):
-            cn = _norm(col)
-            score = 0
-            for i, kw in enumerate(pay_priority):
-                if kw in cn: score += (100 - i)
-            if "fecha" in cn: score += 1
-            return score
-        candidates_date.sort(key=score_date, reverse=True)
-        if not candidates_date:
-            continue
-        dcol = candidates_date[0]
-        ds = _to_date_series(df[dcol])
-
-        # --- elegir columna id de factura ---
-        id_cols = []
-        for c in df.columns:
-            cn = _norm(c)
-            if any(kw in cn for kw in id_priority):
-                id_cols.append(c)
-        id_col = id_cols[0] if id_cols else df.columns[0]
-
-        # --- elegir columna monto ---
-        money_cols = []
-        for c in df.columns:
-            cn = _norm(c)
-            if any(kw in cn for kw in money_priority):
-                money_cols.append(c)
-        mcol = money_cols[0] if money_cols else None
-
-        s_date = start.date(); e_date = end.date()
-        m = (ds >= s_date) & (ds <= e_date)
-        if m.any():
-            sub = df.loc[m, [id_col] + ([mcol] if mcol else [])].copy()
-            sub.rename(columns={id_col: "FACTURA", mcol: "MONTO" if mcol else None}, inplace=True)
-            sub["VENCIMIENTO"] = ds[m].astype("string")
-            sub["HOJA"] = hoja
-            # normaliza monto
-            if "MONTO" in sub.columns:
-                sub["MONTO"] = pd.to_numeric(sub["MONTO"], errors="coerce").fillna(0.0)
-            rows.append(sub)
-
-    if not rows:
-        return pd.DataFrame(columns=["FACTURA","VENCIMIENTO","MONTO","HOJA"])
-
-    out = pd.concat(rows, ignore_index=True)
-    # Ordena por vencimiento asc
-    try:
-        out["_v"] = pd.to_datetime(out["VENCIMIENTO"], dayfirst=True, errors="coerce")
-        out = out.sort_values("_v").drop(columns=["_v"])
-    except Exception:
-        pass
-    return out
-
-def _choose_date_col(df: pd.DataFrame, roles: Dict[str,str], question: str) -> str | None:
-    # tries to pick the most relevant 'date' column based on hints present in the question
-    q = _norm(question)
-    date_cols = [c for c,r in roles.items() if r == "date"]
-    if not date_cols:
-        return None
-    priority = []
-    for c in date_cols:
-        cn = _norm(c)
-        score = 0
-        # prioridad por tipo de fecha en función de la pregunta
-        if any(w in q for w in ["pagar","pago","pagos","por pagar","pendiente","pendientes",
-                                 "venc","vence","vencen","vencimiento","vcto","vto","venc."]):
-            if ("venc" in cn) or ("vcto" in cn) or ("vto" in cn):
-                score += 10  # fecha de vencimiento
-            if "pago" in cn:
-                score += 8   # fecha de pago programado
-        # señales genéricas
-        if "emision" in cn or "emisión" in cn: score += 3
-        if "ingreso" in cn or "recep" in cn:    score += 2
-        if "salida" in cn or "entrega" in cn:   score += 2
-        if any(k in q for k in ["emision","emisión"]) and ("emision" in cn or "emisión" in cn): score += 4
-        if "ingreso" in q and "ingreso" in cn: score += 4
-        if "salida" in q and "salida" in cn:   score += 4
-        priority.append((score, c))
-    priority.sort(reverse=True)
-    return priority[0][1] if priority else date_cols[0]
-
-
-
-def _likely_date_series(s) -> bool:
-
-def _to_date_series(obj) -> "pd.Series":
-    """Return a pd.Series of python date objects parsed from obj."""
-    dt = pd.to_datetime(obj, errors="coerce", dayfirst=True)
-    try:
-        return dt.dt.date
-    except Exception:
-        # if it's already a date dtype or scalar-like
-        return pd.to_datetime(pd.Series(obj), errors="coerce", dayfirst=True).dt.date
-    try:
-        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
-        ratio = (dt.notna().sum() / max(len(dt), 1))
-        return ratio >= 0.4  # consider "date-like" if >=40% parseable
-    except Exception:
-        return False
-
-
-def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str):
-    """
-    Si la pregunta contiene fechas/rangos, filtra por una columna de fecha adecuada.
-    - Para consultas de pagos/vencimientos, prioriza columnas de vencimiento/pago aunque no estén marcadas como 'date'.
-    - Si el filtro deja 0 filas, intenta un segundo pase probando columnas fecha "probables".
-    Devuelve (data_filtrada, meta_dict)
-    """
-    rng = extract_date_range_from_question_es(question or "")
-    if not rng:
-        return data, {"applied": False}
-
-    start = pd.Timestamp(rng["start"]).normalize()
-    end   = pd.Timestamp(rng["end"]).normalize()
-
-    q = _norm(question or "")
-    pay_intent = any(w in q for w in [
-        "pagar","pago","pagos","por pagar","pendiente","pendientes",
-        "venc","vence","vencen","vencimiento","vcto","vto","venc."
-    ])
-
-    # prioridades para nombres de columnas de fecha cuando hay intención de pago
-    pay_priority = ["venc", "vcto", "vto", "vencim", "pago", "f. pago", "fpago", "fecha pago", "fecha de pago"]
-
-    def _order_candidates(cols, question_is_pay):
-        scored = []
-        for c in cols:
-            cn = _norm(c)
-            score = 0
-            if question_is_pay:
-                for i,kw in enumerate(pay_priority):
-                    if kw in cn:
-                        score += (100 - i)  # más a la izquierda, más peso
-            # reglas genéricas (mantener las existentes)
-            if "emision" in cn or "emisión" in cn: score += 3
-            if "ingreso" in cn or "recep" in cn:  score += 2
-            if "salida" in cn or "entrega" in cn: score += 2
-            scored.append((score, c))
-        scored.sort(reverse=True)
-        return [c for _,c in scored] if scored else cols
-
-    out = {}
-    used_cols = {}
-    any_rows = False
-
-    for h, df in (data or {}).items():
-        if df is None or df.empty:
-            out[h] = df
-            continue
-
-        roles = detect_roles_for_sheet(df, h)
-        date_cols = [c for c,r in roles.items() if r == "date"]
-
-        # Si no hay 'date' o es consulta de pagos, amplia candidatos con heurística por nombre/valores
-        extra_candidates = []
-        for c in df.columns:
-            cn = _norm(c)
-            # agrega si parece fecha por nombre o por valores
-            if (pay_intent and any(kw in cn for kw in pay_priority)) or ("fecha" in cn) or _likely_date_series(df[c]):
-                if c not in date_cols:
-                    extra_candidates.append(c)
-
-        candidates = list(dict.fromkeys(date_cols + extra_candidates))  # únicos y en orden
-        if pay_intent:
-            candidates = _order_candidates(candidates, True)
-        else:
-            candidates = _order_candidates(candidates, False)
-
-        chosen = None
-        dt = None
-        for c in candidates:
-            try:
-                tmp = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
-                if tmp.notna().sum() == 0:
-                    continue
-                chosen = c
-                dt = tmp
-                break
-            except Exception:
-                continue
-
-        if chosen is None:
-            out[h] = df
-            continue
-
-        ds = _to_date_series(dt)
-        s_date = start.date(); e_date = end.date()
-        mask = (ds >= s_date) & (ds <= e_date)
-        dff = df.loc[mask].copy()
-        out[h] = dff
-        used_cols[h] = chosen
-        if len(dff) > 0:
-            any_rows = True
-
-    # Si no quedó ninguna fila y la intención es pagos, intenta último fallback con cualquier columna que contenga 'venc'/'pago'
-    if not any_rows and pay_intent:
-        for h, df in (data or {}).items():
-            if df is None or df.empty:
-                continue
-            col = None
-            for c in df.columns:
-                cn = _norm(c)
-                if any(kw in cn for kw in pay_priority):
-                    col = c; break
-            if col:
-                dt = pd.to_datetime(df[col], errors="coerce", dayfirst=True)
-                ds = _to_date_series(dt)
-        s_date = start.date(); e_date = end.date()
-        mask = (ds >= s_date) & (ds <= e_date)
-                out[h] = df.loc[mask].copy()
-                used_cols[h] = col
-
-    meta = {
-        "applied": True,
-        "start": str(start.date()),
-        "end": str(end.date()),
-        "by_sheet": used_cols
-    }
-    return out, meta
-
-
 QTY_PAT  = re.compile(r'(?i)(cantidad|unidades|servicios|items|piezas|qty|cant)')
 CAT_HINT = re.compile(r'(?i)(tipo|clase|categoria|estado|proceso|servicio|cliente|patente|sucursal|marca|modelo|vehiculo|vehículo)')
 
@@ -1504,9 +1226,9 @@ def compose_market_text(data: Dict[str, Any]) -> str:
 # ======== Prompts LLM ========
 def make_system_prompt():
     today = _now_scl().strftime("%Y-%m-%d")
-    return ("Eres un Controller Financiero senior para un taller de desabolladura y pintura. "
+    return ("Eres un controller financiero senior para un taller de desabolladura y pintura. "
             f"Fecha de hoy (America/Santiago): {today}. "
-            "Responde SIEMPRE con estilo ejecutivo + analítico y basándote EXCLUSIVAMENTE en la planilla.")
+            "Responde con precisión y recomendaciones accionables, usando solo los datos entregados.")
 
 ANALYSIS_FORMAT = """
 Escribe SIEMPRE en este formato (usa '###' y bullets '- '):
@@ -2099,10 +1821,9 @@ elif ss.menu_sel == "Consulta IA":
 
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
-            data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
-            schema = _build_schema(data_filt)
+            schema = _build_schema(data)
             plan_c = plan_compute_from_llm(pregunta, schema)
-            facts = execute_compute(plan_c, data_filt)
+            facts = execute_compute(plan_c, data)
 
             if not facts.get("ok"):
                 with left:
@@ -2117,7 +1838,7 @@ elif ss.menu_sel == "Consulta IA":
                     ok = False
                     try:
                         plan = plan_from_llm(pregunta, schema)
-                        ok = execute_plan(plan, data_filt)
+                        ok = execute_plan(plan, data)
                     except Exception as e:
                         st.error(f"Error ejecutando plan: {e}")
                     if not ok:
@@ -2215,5 +1936,89 @@ elif ss.menu_sel == "Diagnóstico IA":
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
 
+
+
+
+def compute_due_invoices_if_applicable(data: Dict[str, pd.DataFrame], question: str):
+    """
+    Si la pregunta es de pagos/vencimientos, devuelve DataFrame con:
+    FACTURA (ID), VENCIMIENTO, MONTO (si existe), HOJA.
+    Si no aplica, devuelve None.
+    """
+    q = _norm(question or "")
+    intent = any(w in q for w in [
+        "pagar","pago","pagos","por pagar","pendiente","pendientes",
+        "venc","vence","vencen","vencimiento","vcto","vto","venc."
+    ])
+    if not intent:
+        return None
+
+    rng = extract_date_range_from_question_es(question or "")
+    if not rng:
+        now = _now_scl().normalize()
+        rng = {"start": now, "end": now + pd.Timedelta(days=6), "label": "próximos 7 días"}
+
+    s_date = rng["start"].date()
+    e_date = rng["end"].date()
+
+    pay_priority = ["venc", "vcto", "vto", "vencim", "fecha pago", "f. pago", "fpago", "pago"]
+    id_priority  = ["factura", "n°", "nro", "numero", "número", "doc", "documento", "folio", "id"]
+    money_priority = ["monto", "total", "importe", "neto", "valor", "bruto"]
+
+    rows = []
+    for hoja, df in (data or {}).items():
+        if df is None or df.empty:
+            continue
+
+        # columna de vencimiento/pago
+        cand_date = []
+        for c in df.columns:
+            cn = _norm(c)
+            if any(kw in cn for kw in pay_priority) or "fecha" in cn or _likely_date_series(df[c]):
+                cand_date.append(c)
+        if not cand_date:
+            continue
+        def _score_date(col):
+            cn = _norm(col); score = 0
+            for i, kw in enumerate(pay_priority):
+                if kw in cn: score += (100 - i)
+            if "fecha" in cn: score += 1
+            return score
+        cand_date.sort(key=_score_date, reverse=True)
+        dcol = cand_date[0]
+        ds = _to_date_series(df[dcol])
+
+        # columna ID
+        id_cols = [c for c in df.columns if any(kw in _norm(c) for kw in id_priority)]
+        id_col = id_cols[0] if id_cols else df.columns[0]
+
+        # columna monto (opcional)
+        money_cols = [c for c in df.columns if any(kw in _norm(c) for kw in money_priority)]
+        mcol = money_cols[0] if money_cols else None
+
+        mask = (ds >= s_date) & (ds <= e_date)
+        if mask.any():
+            cols = [id_col]
+            if mcol: cols.append(mcol)
+            sub = df.loc[mask, cols].copy()
+            sub.rename(columns={id_col:"FACTURA"}, inplace=True)
+            if mcol: sub.rename(columns={mcol:"MONTO"}, inplace=True)
+            sub["VENCIMIENTO"] = pd.to_datetime(ds[mask]).astype("datetime64[ns]").astype("datetime64[ns]")
+            sub["VENCIMIENTO"] = pd.to_datetime(sub["VENCIMIENTO"]).dt.strftime("%d/%m/%Y")
+            sub["HOJA"] = hoja
+            if "MONTO" in sub.columns:
+                sub["MONTO"] = pd.to_numeric(sub["MONTO"], errors="coerce").fillna(0.0)
+            rows.append(sub)
+
+    if not rows:
+        return pd.DataFrame(columns=["FACTURA","VENCIMIENTO","MONTO","HOJA"])
+
+    out = pd.concat(rows, ignore_index=True)
+    try:
+        out["_v"] = pd.to_datetime(out["VENCIMIENTO"], dayfirst=True, errors="coerce")
+        out = out.sort_values("_v").drop(columns=["_v"])
+    except Exception:
+        pass
+    return out
 
 
