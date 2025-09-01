@@ -16,7 +16,7 @@ from streamlit.components.v1 import html as st_html
 
 from analizador import analizar_datos_taller
 
-APP_BUILD = "build-2025-09-01-v5-dates"
+APP_BUILD = "build-2025-08-27-focus-v7b"
 FAVICON_PATH = st.secrets.get("FAVICON_PATH", "Isotipo_Nexa.png") or "Isotipo_Nexa.png"
 
 st.set_page_config(layout="wide", page_title="Controller Financiero IA", page_icon=FAVICON_PATH)
@@ -548,270 +548,6 @@ ID_PAT   = re.compile(r'(?i)\b(id|folio|factura|boleta|ot|orden|nro|n°|correlat
 MONEY_PAT= re.compile(r'(?i)(monto|valor|ingreso|ingresos|costo|costos|neto|bruto|precio|tarifa|pago|total|subtotal|margen|venta|ventas|compras)')
 PCT_PAT  = re.compile(r'(?i)(%|porcentaje|tasa|margen %|margen_pct|conversion)')
 DATE_PAT = re.compile(r'(?i)(fecha|emision|f_emision|periodo|mes|año|anio|fecha_factura|fecha_ot|fecha_ingreso|fecha_salida)')
-# ======== Fechas (parser ES) v5 ========
-def _now_scl():
-    try:
-        return pd.Timestamp.now(tz="America/Santiago")
-    except Exception:
-        return pd.Timestamp.now()
-
-_ES_MONTHS = {
-    "enero":1, "febrero":2, "marzo":3, "abril":4, "mayo":5, "junio":6,
-    "julio":7, "agosto":8, "septiembre":9, "setiembre":9, "octubre":10,
-    "noviembre":11, "diciembre":12
-}
-
-def _eom(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(ts).normalize()
-    # end of month inclusive
-    return (ts + pd.tseries.offsets.MonthEnd(0)).normalize()
-
-def _som(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.Timestamp(ts).normalize()
-    return ts - pd.offsets.Day(ts.day - 1)
-
-def _parse_single_date_es(s: str) -> dict | None:
-    if not s: return None
-    t = _norm(s)
-    # Try standard numeric formats first
-    for dayfirst in (True, False):
-        try:
-            dt = pd.to_datetime(t, dayfirst=dayfirst, errors="raise")
-            return {"kind": "day", "start": pd.Timestamp(dt).normalize(), "end": pd.Timestamp(dt).normalize()}
-        except Exception:
-            pass
-    # "12 de agosto de 2025" / "12 agosto 2025"
-    m = re.search(r'\b(\d{1,2})\s*(de\s*)?([a-záéíóú]+)\s*(de\s*)?(\d{4})\b', t)
-    if m:
-        d = int(m.group(1))
-        mon = m.group(3).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(5))
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            try:
-                dt = pd.Timestamp(year=y, month=mm, day=d)
-                return {"kind": "day", "start": dt.normalize(), "end": dt.normalize()}
-            except Exception:
-                pass
-    # "agosto 2025" o "2025 agosto"
-    m = re.search(r'\b([a-záéíóú]+)\s+(\d{4})\b', t)
-    if not m:
-        m = re.search(r'\b(\d{4})\s+([a-záéíóú]+)\b', t)
-        if m:
-            mon = m.group(2).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-            y = int(m.group(1))
-        else:
-            mon = y = None
-    else:
-        mon = m.group(1).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(2))
-    if mon and y:
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            start = pd.Timestamp(year=y, month=mm, day=1)
-            end = _eom(start)
-            return {"kind": "month", "start": start.normalize(), "end": end.normalize()}
-    return None
-
-def extract_date_range_from_question_es(q: str):
-    """
-    Extrae un rango [start, end] desde una pregunta en español.
-    Soporta pasado y FUTURO, con zona horaria de Santiago.
-    Casos reconocidos (ejemplos):
-      - "hoy", "ayer", "mañana"
-      - "últimos 7 días", "últimas 2 semanas", "últimos 3 meses", "este mes"
-      - "próximos 10 días", "próximas 2 semanas", "próximo mes", "esta semana", "próxima semana", "semana pasada"
-      - "entre 10/08/2025 y 25/08/2025", "desde enero 2025", "en agosto 2025", "26/01/2025"
-      - "hasta hoy", "desde hoy"
-    Devuelve dict con: start (Timestamp), end (Timestamp), label (str)
-    """
-    import re
-    import pandas as pd
-
-    t = (q or "").strip().lower()
-    now = pd.Timestamp.now(tz="America/Santiago")
-
-    # Normalizadores útiles
-    def _start_of_week(d):
-        # semana ISO (lunes=0 ... domingo=6)
-        return d - pd.Timedelta(days=int(d.weekday()))
-    def _end_of_week(d):
-        return _start_of_week(d) + pd.Timedelta(days=6)
-    def _start_of_month(d):
-        return pd.Timestamp(year=int(d.year), month=int(d.month), day=1, tz=d.tz)
-    def _end_of_month(d):
-        s = _start_of_month(d)
-        return (s + pd.offsets.MonthEnd(1)).normalize().tz_localize(d.tz) if s.tz is None else (s + pd.offsets.MonthEnd(1))
-
-    # Palabras sueltas
-    if re.search(r'\bhoy\b', t):
-        return {"start": now.normalize(), "end": now.normalize(), "label": "hoy"}
-    if re.search(r'\bayer\b', t):
-        y = (now - pd.Timedelta(days=1)).normalize()
-        return {"start": y, "end": y, "label": "ayer"}
-    if re.search(r'\bmañana\b', t) or re.search(r'\bmanana\b', t):
-        m = (now + pd.Timedelta(days=1)).normalize()
-        return {"start": m, "end": m, "label": "mañana"}
-
-    # Esta semana / próxima / pasada
-    if re.search(r'\besta\s+semana\b', t):
-        s, e = _start_of_week(now).normalize(), _end_of_week(now).normalize()
-        return {"start": s, "end": e, "label": "esta semana"}
-    if re.search(r'\bpr[oó]xima\s+semana\b', t):
-        n = now + pd.Timedelta(weeks=1)
-        s, e = _start_of_week(n).normalize(), _end_of_week(n).normalize()
-        return {"start": s, "end": e, "label": "próxima semana"}
-    if re.search(r'\bsemana\s+pasada\b', t):
-        p = now - pd.Timedelta(weeks=1)
-        s, e = _start_of_week(p).normalize(), _end_of_week(p).normalize()
-        return {"start": s, "end": e, "label": "semana pasada"}
-
-    # Este mes / próximo / pasado
-    if re.search(r'\beste\s+mes\b', t):
-        s = _start_of_month(now).normalize()
-        e = (_end_of_month(now)).normalize()
-        return {"start": s, "end": e, "label": "este mes"}
-    if re.search(r'\bpr[oó]ximo\s+mes\b', t):
-        n = now + pd.offsets.MonthBegin(1)
-        s = pd.Timestamp(year=int(n.year), month=int(n.month), day=1, tz=now.tz).normalize()
-        e = (s + pd.offsets.MonthEnd(1)).normalize()
-        return {"start": s, "end": e, "label": "próximo mes"}
-    if re.search(r'\bmes\s+pasado\b', t):
-        p = now - pd.offsets.MonthBegin(1)
-        p = p - pd.offsets.MonthBegin(1)  # ir al comienzo del mes anterior
-        s = pd.Timestamp(year=int(p.year), month=int(p.month), day=1, tz=now.tz).normalize()
-        e = (s + pd.offsets.MonthEnd(1)).normalize()
-        return {"start": s, "end": e, "label": "mes pasado"}
-
-    # Últimos X (pasado)
-    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+d[ií]as\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.Timedelta(days=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimos {n} días"}
-    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+semanas?\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.Timedelta(weeks=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimas {n} semanas"}
-    m = re.search(r'\b[úu]ltim[oa]s?\s+(\d+)\s+mes(?:es)?\b', t)
-    if m:
-        n = int(m.group(1)); s = (now - pd.offsets.DateOffset(months=n)).normalize(); e = now.normalize()
-        return {"start": s, "end": e, "label": f"últimos {n} meses"}
-
-    # PRÓXIMOS X (futuro)
-    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(days=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximos {n} días"}
-    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+semanas?\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(weeks=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximas {n} semanas"}
-    m = re.search(r'\bpr[oó]xim[oa]s?\s+(\d+)\s+mes(?:es)?\b', t)
-    if m:
-        n = int(m.group(1)); s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.offsets.DateOffset(months=n)).normalize()
-        return {"start": s, "end": e, "label": f"próximos {n} meses"}
-
-    # "en los próximos días" (sin número) → por defecto 7 días
-    if re.search(r'\b(en\s+los\s+)?pr[oó]xim[oa]s?\s+d[ií]as\b', t):
-        s = (now + pd.Timedelta(days=1)).normalize(); e = (now + pd.Timedelta(days=7)).normalize()
-        return {"start": s, "end": e, "label": "próximos días"}
-
-    # hasta hoy / desde hoy
-    if re.search(r'\bhasta\s+hoy\b', t):
-        s = (now - pd.Timedelta(days=365)).normalize()
-        return {"start": s, "end": now.normalize(), "label": "hasta hoy"}
-    if re.search(r'\bdesde\s+hoy\b', t):
-        return {"start": now.normalize(), "end": (now + pd.Timedelta(days=365)).normalize(), "label": "desde hoy"}
-
-    # entre <fecha> y <fecha>
-    m = re.search(r'\bentre\s+([0-9/.\-]+)\s+y\s+([0-9/.\-]+)\b', t)
-    if m:
-        try:
-            s = pd.to_datetime(m.group(1), dayfirst=True, errors='coerce')
-            e = pd.to_datetime(m.group(2), dayfirst=True, errors='coerce')
-            if pd.notna(s) and pd.notna(e):
-                return {"start": s.normalize(), "end": e.normalize(), "label": f"entre {m.group(1)} y {m.group(2)}"}
-        except Exception:
-            pass
-
-    # "desde <mes> [año]"
-    _ES_MONTHS = {
-        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
-        "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
-    }
-
-    m = re.search(r'\bdesde\s+([a-záéíóú]+)(?:\s+de)?\s*(\d{4})?\b', t)
-    if m:
-        mon = m.group(1).replace("á","a").replace("é","e").replace("í","i").replace("ó","o").replace("ú","u")
-        y = int(m.group(2)) if m.group(2) else int(now.year)
-        mm = _ES_MONTHS.get(mon, None)
-        if mm:
-            start = pd.Timestamp(year=y, month=mm, day=1)
-            return {"start": start.normalize(), "end": now.normalize(), "label": f"desde {mon} {y}"}
-
-    # Single explicit date or month-year
-    parsed = _parse_single_date_es(t)
-    if parsed:
-        return {"start": parsed["start"], "end": parsed["end"], "label": parsed["kind"]}
-
-    return None
-def _choose_date_col(df: pd.DataFrame, roles: Dict[str,str], question: str) -> str | None:
-    # tries to pick the most relevant 'date' column based on hints present in the question
-    q = _norm(question)
-    date_cols = [c for c,r in roles.items() if r == "date"]
-    if not date_cols:
-        return None
-    priority = []
-    for c in date_cols:
-        cn = _norm(c)
-        score = 0
-# hints en nombre de columna
-if "emision" in cn or "emisión" in cn: score += 3
-if "ingreso" in cn or "recep" in cn:    score += 2
-if "salida" in cn or "entrega" in cn:   score += 2
-if "venc" in cn or "pago" in cn or "due" in cn: score += 4
-
-# hints por la pregunta
-if any(k in q for k in ["emision","emisión"]) and ("emision" in cn or "emisión" in cn): score += 4
-if "ingreso" in q and "ingreso" in cn: score += 4
-if "salida" in q and "salida" in cn:   score += 4
-if any(k in q for k in ["venc","vencimiento","pago","pagar","due"]): 
-    if any(k in cn for k in ["venc","vencimiento","pago","due"]): score += 6
-
-priority.append((score, c))
-        priority.sort(reverse=True)
-        return priority[0][1] if priority else date_cols[0]
-
-def filter_data_by_question_if_time(data: Dict[str, pd.DataFrame], question: str):
-    """
-    Si la pregunta contiene fechas o rangos, filtra TODAS las hojas por la mejor columna de fecha detectada.
-    Devuelve (data_filtrada, meta_dict)
-    """
-    rng = extract_date_range_from_question_es(question or "")
-    if not rng:
-        return data, {"applied": False}
-
-    start = pd.Timestamp(rng["start"]).normalize()
-    end   = pd.Timestamp(rng["end"]).normalize()
-    out = {}
-    used_cols = {}
-
-    for h, df in (data or {}).items():
-        if df is None or df.empty:
-            out[h] = df
-            continue
-        roles = detect_roles_for_sheet(df, h)
-        date_col = _choose_date_col(df, roles, question)
-        if not date_col:
-            out[h] = df
-            continue
-        dt = pd.to_datetime(df[date_col], errors="coerce")
-        mask = (dt >= start) & (dt <= (end + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)))
-        out[h] = df[mask].copy()
-        used_cols[h] = date_col
-
-    return out, {"applied": True, "start": str(start.date()), "end": str(end.date()), "by_sheet": used_cols}
-
 QTY_PAT  = re.compile(r'(?i)(cantidad|unidades|servicios|items|piezas|qty|cant)')
 CAT_HINT = re.compile(r'(?i)(tipo|clase|categoria|estado|proceso|servicio|cliente|patente|sucursal|marca|modelo|vehiculo|vehículo)')
 
@@ -1147,63 +883,6 @@ def best_count_by_category(data: Dict[str,pd.DataFrame], category_match: callabl
     return None, None, None, None
 
 # ======== Insights & textos ========
-def _normalize_role_name(s: str) -> str:
-    s = (s or "").strip().lower()
-    mapping = {
-        "fecha": "date", "fechas": "date", "date": "date",
-        "id": "id", "folio": "id", "orden": "id",
-        "monto": "money", "dinero": "money", "importe": "money", "total": "money",
-        "categoria": "category", "categoría": "category", "category": "category",
-        "texto": "text", "text": "text", "descripcion": "text", "descripción": "text",
-        "porcentaje": "percent", "percent": "percent", "%": "percent",
-        "estado": "category", "cliente": "category", "proceso": "category", "servicio": "category"
-    }
-    return mapping.get(s, s)
-
-def apply_dictionary_from_sheets(data: Dict[str, pd.DataFrame]):
-    """
-    Busca una hoja llamada 'DICCIONARIO' (o variantes) con columnas:
-      hoja | columna | rol | (opcional) explicacion | (opcional) alias
-    y carga estas reglas a session_state.roles_forced y session_state.aliases.
-    """
-    names = list(data.keys()) if isinstance(data, dict) else []
-    target = None
-    for cand in ["DICCIONARIO","Diccionario","diccionario","DICTIONARY","Dictionary"]:
-        if cand in names:
-            target = cand; break
-    if not target:
-        return False
-
-    df = data.get(target)
-    if df is None or df.empty:
-        return False
-
-    forced = {}
-    aliases = {}
-
-    # normalizar columnas
-    cols = {c.strip().lower(): c for c in df.columns}
-    col_hoja = cols.get("hoja") or cols.get("sheet") or cols.get("tabla")
-    col_col  = cols.get("columna") or cols.get("col") or cols.get("campo")
-    col_rol  = cols.get("rol") or cols.get("role")
-    col_exp  = cols.get("explicacion") or cols.get("explicación") or cols.get("explain") or None
-    col_alias= cols.get("alias") or None
-
-    for _, r in df.iterrows():
-        hoja  = str(r.get(col_hoja, "")).strip()
-        col   = str(r.get(col_col, "")).strip()
-        rol   = _normalize_role_name(r.get(col_rol, ""))
-        if not hoja or not col or not rol:
-            continue
-        forced.setdefault(hoja, {})[col] = rol
-        if col_alias and str(r.get(col_alias) or "").strip():
-            aliases.setdefault(hoja, {})[col] = str(r.get(col_alias)).strip()
-
-    # Guardar en session_state para que detect_roles_for_sheet lo use
-    ss.roles_forced = forced
-    ss.aliases = aliases
-    return True
-
 def derive_global_insights(data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         kpis = analizar_datos_taller(data, "") or {}
@@ -1399,9 +1078,7 @@ def compose_market_text(data: Dict[str, Any]) -> str:
 
 # ======== Prompts LLM ========
 def make_system_prompt():
-    today = _now_scl().strftime("%Y-%m-%d")
     return ("Eres un Controller Financiero senior para un taller de desabolladura y pintura. "
-            f"Fecha de hoy (America/Santiago): {today}. "
             "Responde SIEMPRE con estilo ejecutivo + analítico y basándote EXCLUSIVAMENTE en la planilla.")
 
 ANALYSIS_FORMAT = """
@@ -1847,7 +1524,6 @@ if ss.menu_sel == "Datos":
         file = st.file_uploader("Sube un Excel", type=["xlsx","xls"])
         if file:
             ss.data = load_excel(file)
-            _ = apply_dictionary_from_sheets(ss.data)
             st.success("Excel cargado.")
     else:
         with st.form(key="form_gsheet"):
@@ -1856,7 +1532,6 @@ if ss.menu_sel == "Datos":
         if conectar and url:
             try:
                 ss.data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
-                _ = apply_dictionary_from_sheets(ss.data)
                 ss.sheet_url = url
                 st.success("Google Sheet conectado.")
             except Exception as e:
@@ -1997,10 +1672,9 @@ elif ss.menu_sel == "Consulta IA":
 
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
-            data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
-            schema = _build_schema(data_filt)
+            schema = _build_schema(data)
             plan_c = plan_compute_from_llm(pregunta, schema)
-            facts = execute_compute(plan_c, data_filt)
+            facts = execute_compute(plan_c, data)
 
             if not facts.get("ok"):
                 with left:
@@ -2015,7 +1689,7 @@ elif ss.menu_sel == "Consulta IA":
                     ok = False
                     try:
                         plan = plan_from_llm(pregunta, schema)
-                        ok = execute_plan(plan, data_filt)
+                        ok = execute_plan(plan, data)
                     except Exception as e:
                         st.error(f"Error ejecutando plan: {e}")
                     if not ok:
@@ -2112,4 +1786,5 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
 
