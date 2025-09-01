@@ -1868,6 +1868,66 @@ elif ss.menu_sel == "Consulta IA":
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
 
+            # === FALLBACKS DETERMINISTICOS (pegar dentro de tu app.py justo al procesar la pregunta) ===
+_q = str(pregunta).lower()
+
+# Asegura tener role_idx
+try:
+    role_idx
+except NameError:
+    dic_df = data.get("DICCIONARIO") if isinstance(data, dict) else None
+    role_idx = build_role_index(dic_df) if dic_df is not None else {}
+
+# 1) Entregados que aún no han sido facturados (últimos 120 días)
+if ("entreg" in _q) and ("no han sido factur" in _q or "no factur" in _q or "sin factur" in _q):
+    df = entregados_no_facturados(data, role_idx, days_back=120)
+    st.markdown("### Vehículos entregados SIN facturación (últimos 120 días)")
+    if df.empty:
+        st.info("No se encontraron vehículos entregados sin facturación en la ventana analizada.")
+    else:
+        df["fecha_entrega"] = pd.to_datetime(df["fecha_entrega"]).dt.strftime("%d/%m/%Y")
+        st.dataframe(df.sort_values("fecha_entrega", ascending=False), use_container_width=True, hide_index=True)
+        st.caption(f"Total: {len(df)}")
+    st.stop()
+
+# 2) ¿Cuántos días tienen los vehículos en el taller?
+if ("dias" in _q or "días" in _q) and ("taller" in _q):
+    df = en_taller_con_dias(data, role_idx, top_n=10)
+    st.markdown("### Top 10 vehículos en taller (no entregados) por días desde recepción")
+    if df.empty:
+        st.info("No se encontraron vehículos recepcionados sin entregar.")
+    else:
+        df["fecha_recepcion"] = pd.to_datetime(df["fecha_recepcion"]).dt.strftime("%d/%m/%Y")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    st.stop()
+
+# 3) ¿Cuántos vehículos se entregan en los próximos días? (sin facturación)
+if ("veh" in _q or "auto" in _q) and ("entreg" in _q) and ("próxim" in _q or "proxim" in _q):
+    import re
+    win = 30
+    m = re.search(r"pr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as", _q)
+    if m: win = int(m.group(1))
+    df = entregas_proximos_dias_sin_factura(data, role_idx, dias=win)
+    st.markdown(f"### Entregas en próximos {win} días (SIN facturación)")
+    if df.empty:
+        st.info("No hay entregas futuras sin facturación en la ventana indicada.")
+    else:
+        df["fecha_entrega"] = pd.to_datetime(df["fecha_entrega"]).dt.strftime("%d/%m/%Y")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(f"Total: {len(df)}")
+    st.stop()
+
+# 4) ¿Cuántos autos que están en el taller sin aprobación?
+if ("taller" in _q) and ("sin aprob" in _q or "sin aprobaci" in _q or "presupuesto enviado" in _q):
+    df = sin_aprobacion_presupuesto(data, role_idx)
+    st.markdown("### Vehículos con presupuesto ENVIADO, no ganados ni perdidos (SIN facturación)")
+    if df.empty:
+        st.info("No se encontraron vehículos con presupuesto 'enviado' pendientes de aprobación.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(f"Total: {len(df)}")
+    st.stop()
+
             # === Fallback determinístico para "facturas a pagar en los próximos días" ===
             try:
                 _dic = data.get("DICCIONARIO") if isinstance(data, dict) else None
