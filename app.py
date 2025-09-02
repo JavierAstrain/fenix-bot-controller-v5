@@ -2199,4 +2199,3 @@ def _smart_list_vehicles(question: str, data: dict):
     footer = f"\n**Total vehículos**: {len(res)}"
     text = header + bullets + "\n" + footer
     return {"text": text, "df": res}
-
