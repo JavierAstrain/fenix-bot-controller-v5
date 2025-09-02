@@ -1913,17 +1913,17 @@ elif ss.menu_sel == "Consulta IA":
             # Smart intent: listado de vehículos/OTs, etc.
             smart = _smart_list_vehicles(pregunta, data_filt)
             if smart is not None:
-            with left:
-            render_ia_html_block(prettify_answer(smart["text"]), height=460)
-            _u = st.session_state.get("_last_usage")
-            if _u:
-            st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
-            with right:
-            if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
-            st.markdown("#### Resultado (tabla)")
-            st.dataframe(smart["df"], use_container_width=True, height=460)
-            st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
-            raise st.stop()
+                with left:
+                render_ia_html_block(prettify_answer(smart["text"]), height=460)
+                _u = st.session_state.get("_last_usage")
+                if _u:
+                st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                with right:
+                if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
+                st.markdown("#### Resultado (tabla)")
+                st.dataframe(smart["df"], use_container_width=True, height=460)
+                st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
+                raise st.stop()
             plan_c = plan_compute_from_llm(pregunta, schema)
             facts = execute_compute(plan_c, data_filt)
 
