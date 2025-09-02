@@ -2,6 +2,116 @@
 # Controller Financiero IA — build: 2025-08-27 focus-v7b
 
 import streamlit as st
+
+
+# ========================
+# Helpers de intención inteligente (listado de vehículos/OTs)
+# ========================
+import unicodedata
+
+def _normtxt(s:str)->str:
+    if s is None: return ""
+    s = str(s)
+    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return s.lower().strip()
+
+def _find_cols(df, keywords):
+    kw = {_normtxt(k) for k in keywords}
+    found = []
+    for c in df.columns:
+        n = _normtxt(c)
+        if any(k in n for k in kw):
+            found.append(c)
+    return found
+
+def _pick_vehicle_cols(df):
+    prefs = [
+        ["PATENTE","PLACA","MATRICULA","MATRÍCULA"],
+        ["MARCA"], ["MODELO"],
+        ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],
+        ["COLOR"], ["AÑO","ANIO"],
+        ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
+        ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],
+        ["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]
+    ]
+    cols = []
+    for group in prefs:
+        got = _find_cols(df, group)
+        if got: cols.append(got[0])
+    if not cols: cols = list(df.columns[:5])
+    return cols[:8]
+
+_DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
+
+def _mask_delivered(df):
+    for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA"]):
+        try:
+            return df[c].notna() & (df[c].astype(str).str.strip()!="")
+        except Exception:
+            pass
+    for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA"]):
+        s = df[c].astype(str).map(_normtxt)
+        return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
+    return pd.Series([True]*len(df))
+
+def _mask_not_invoiced(df):
+    cand = _find_cols(df, ["FACTURA","FACTURACION","FACTURACIÓN","N° FACTURA","NUMERO FACTURA","F. FACTURA","FECHA FACTURA","ESTADO FACTURA"])
+    if not cand: return pd.Series([True]*len(df))
+    m = pd.Series([False]*len(df))
+    for c in cand:
+        s = df[c].astype(str).map(_normtxt)
+        m = m | s.isin({"","nan","none","0","no"}) | s.str.contains("pendient|sin|no fact", na=False)
+    return m
+
+def _smart_list_vehicles(question: str, data: dict):
+    q = _normtxt(question)
+    wants_list = any(w in q for w in [
+        "cuales son","cuáles son","cual es","cuál es",
+        "lista","listado","muestrame","muéstrame","mostrar",
+        "detalla","detallar","que vehic","qué vehic","que autos","qué autos",
+        "vehiculos","vehículos","patentes"
+    ])
+    needs_delivered   = "entreg" in q
+    needs_not_invoiced = ("no han sido factur" in q) or ((" no " in f" {q} ") and ("factur" in q)) or ("pendient" in q)
+
+    if not wants_list:
+        return None
+
+    df = data.get("MODELO_BOT")
+    if df is None or df.empty:
+        return None
+
+    mask = pd.Series([True]*len(df))
+    if needs_delivered:   mask = mask & _mask_delivered(df)
+    if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
+
+    res = df.loc[mask].copy()
+    if res.empty:
+        return {"text": "No encontré vehículos con ese criterio.", "df": pd.DataFrame()}
+
+    cols = _pick_vehicle_cols(res)
+    res  = res[[c for c in cols if c in res.columns]].drop_duplicates().head(200)
+
+    # Mini resumen para la izquierda
+    pat = next((c for c in res.columns if _normtxt(c) in {"patente","placa","matricula","matrícula"}), None)
+    mar = next((c for c in res.columns if _normtxt(c)=="marca"), None)
+    mod = next((c for c in res.columns if _normtxt(c)=="modelo"), None)
+    fe  = next((c for c in res.columns if "entrega" in _normtxt(c)), None)
+
+    preview = []
+    for _, r in res.head(5).iterrows():
+        s = []
+        if pat and r.get(pat): s.append(str(r.get(pat)))
+        if mar and r.get(mar): s.append(str(r.get(mar)))
+        if mod and r.get(mod): s.append(str(r.get(mod)))
+        if fe  and r.get(fe):  s.append(f"entrega: {r.get(fe)}")
+        if s: preview.append(" · ".join(s))
+
+    header  = "### Vehículos encontrados\n"
+    bullets = "\n".join([f"- {x}" for x in preview]) if preview else "- (sin vista previa)"
+    text    = header + bullets + f"\n**Total vehículos**: {len(res)}"
+    return {"text": text, "df": res}
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -14,7 +124,7 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
 
-from analizador import analizar_datos_taller, build_role_index
+from analizador import analizar_datos_taller
 
 APP_BUILD = "build-2025-09-01-v5-dates"
 FAVICON_PATH = st.secrets.get("FAVICON_PATH", "Isotipo_Nexa.png") or "Isotipo_Nexa.png"
@@ -294,33 +404,6 @@ def load_gsheet(json_keyfile: str, sheet_url: str):
     client = gspread.authorize(creds)
     sheet = client.open_by_url(sheet_url)
     return {ws.title: pd.DataFrame(ws.get_all_records()) for ws in sheet.worksheets()}
-
-# --- Alcance de hojas permitido y rol-index desde DICCIONARIO ---
-_WHITELIST = {"modelo_bot", "diccionario", "finanzas"}
-
-def _only_whitelisted_sheets(all_data: dict) -> dict:
-    out = {}
-    for name, df in (all_data or {}).items():
-        if str(name).strip().lower() in _WHITELIST:
-            out[name] = df.copy()
-    # Garantiza existencia de llaves aunque vengan vacías
-    for must in ["MODELO_BOT","DICCIONARIO","FINANZAS"]:
-        if must not in out:
-            out[must] = out.get(must, out.get(must.title(), pd.DataFrame())) if isinstance(out.get(must), pd.DataFrame) else pd.DataFrame()
-    return out
-
-def _build_role_index_from_state(data_dict: dict) -> dict:
-    try:
-        dic_df = None
-        # Buscar 'DICCIONARIO' con tolerancia
-        for k,v in (data_dict or {}).items():
-            if str(k).strip().lower() == "diccionario":
-                dic_df = v; break
-        if dic_df is None or getattr(dic_df, "empty", True):
-            return {}
-        return build_role_index(dic_df)
-    except Exception:
-        return {}
 
 # ======== OpenAI ========
 def _get_openai_client():
@@ -1371,13 +1454,6 @@ Esquema (con roles):
 Pregunta:
 {pregunta}
 
-Formato de salida obligado en bullets:
-- Resumen ejecutivo.
-- Diagnóstico (qué pasa y por qué).
-- Recomendaciones accionables (priorizadas).
-- Estimaciones y proyecciones (base/optimista/conservador si aplica).
-- Riesgos y alertas (con mitigaciones).
-
 {ANALYSIS_FORMAT}
 """
     return [{"role":"system","content":system}, *historial_msgs, {"role":"user","content":user}]
@@ -1526,13 +1602,6 @@ def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
         crow = plan_c.get("category_col") or ""
         ccol = find_col(df, crow) if crow else None
         filters = plan_c.get("filters") or []
-        # Inyecta filtros inferidos desde la pregunta si aplica
-        try:
-            auto_filters = _guess_filters_from_question(plan_c.get("question",""), df)
-            if auto_filters:
-                filters = (filters or []) + auto_filters
-        except Exception:
-            pass
         op = (plan_c.get("op") or "sum").lower()
 
         vrole = roles.get(vcol, "unknown")
@@ -1755,8 +1824,6 @@ if ss.menu_sel == "Datos":
         file = st.file_uploader("Sube un Excel", type=["xlsx","xls"])
         if file:
             ss.data = load_excel(file)
-            ss.data = _only_whitelisted_sheets(ss.data)
-            st.session_state['role_index'] = _build_role_index_from_state(ss.data)
             st.success("Excel cargado.")
     else:
         with st.form(key="form_gsheet"):
@@ -1765,8 +1832,6 @@ if ss.menu_sel == "Datos":
         if conectar and url:
             try:
                 ss.data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
-                ss.data = _only_whitelisted_sheets(ss.data)
-                st.session_state['role_index'] = _build_role_index_from_state(ss.data)
                 ss.sheet_url = url
                 st.success("Google Sheet conectado.")
             except Exception as e:
@@ -1905,115 +1970,67 @@ elif ss.menu_sel == "Consulta IA":
                 if not found:
                     st.info("No encontré (fecha + monto) para estacionalidad.")
 
-        # ------- Responder (junto a la pregunta) -------
+        
+# ------- Responder (junto a la pregunta) -------
+if responder_click and pregunta:
+    # Prepara datos y esquema (si la pregunta trae fechas, filtramos)
+    data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
+    schema = _build_schema(data_filt)
 
-# --- Ensure smart listing helpers are defined before use ---
-if '_smart_list_vehicles' not in globals():
-    import unicodedata
-    def _normtxt(s:str)->str:
-        if s is None: return ""
-        s = str(s)
-        s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-        return s.lower().strip()
-    def _find_cols(df, keywords):
-        kw = {_normtxt(k) for k in keywords}
-        found = []
-        for c in df.columns:
-            n = _normtxt(c)
-            if any(k in n for k in kw): found.append(c)
-        return found
-    def _pick_vehicle_cols(df):
-        prefs = [["PATENTE","PLACA","MATRICULA","MATRÍCULA"],["MARCA"],["MODELO"],
-                 ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],["COLOR"],["AÑO","ANIO"],
-                 ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
-                 ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]]
-        cols = []
-        for group in prefs:
-            got = _find_cols(df, group)
-            if got: cols.append(got[0])
-        if not cols: cols = list(df.columns[:5])
-        return cols[:8]
-    _DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
-    def _mask_delivered(df):
-        for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA"]):
-            try:
-                return df[c].notna() & (df[c].astype(str).str.strip()!="")
-            except Exception:
-                pass
-        for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA"]):
-            s = df[c].astype(str).map(_normtxt)
-            return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
-        return pd.Series([True]*len(df))
-    def _mask_not_invoiced(df):
-        cand = _find_cols(df, ["FACTURA","FACTURACION","FACTURACIÓN","N° FACTURA","NUMERO FACTURA","F. FACTURA","FECHA FACTURA","ESTADO FACTURA"])
-        if not cand: return pd.Series([True]*len(df))
-        m = pd.Series([False]*len(df))
-        for c in cand:
-            s = df[c].astype(str).map(_normtxt)
-            m = m | s.isin({"","nan","none","0","no"}) | s.str.contains("pendient|sin|no fact", na=False)
-        return m
-    def _smart_list_vehicles(question: str, data: dict):
-        q = _normtxt(question)
-        wants_list = any(w in q for w in ["cuales son","cual es","lista","listado","muestrame","mostrar","detalla","detallar","que vehic","que autos","vehiculos","vehículo","patentes"])
-        needs_delivered = "entreg" in q
-        needs_not_invoiced = "no han sido factur" in q or ("no" in q and "factur" in q) or "pendient" in q
-        if not wants_list: return None
-        df = data.get("MODELO_BOT")
-        if df is None or df.empty: return None
-        mask = pd.Series([True]*len(df))
-        if needs_delivered: mask = mask & _mask_delivered(df)
-        if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
-        res = df.loc[mask].copy()
-        if res.empty: return {"text": "No encontré vehículos con ese criterio.", "df": pd.DataFrame()}
-        cols = _pick_vehicle_cols(res)
-        res = res[[c for c in cols if c in res.columns]].drop_duplicates().head(200)
-        pat = next((c for c in res.columns if _normtxt(c) in {"patente","placa","matricula","matrícula"}), None)
-        mar = next((c for c in res.columns if _normtxt(c)=="marca"), None)
-        mod = next((c for c in res.columns if _normtxt(c)=="modelo"), None)
-        fe = next((c for c in res.columns if "entrega" in _normtxt(c)), None)
-        sample = []
-        for _,r in res.head(5).iterrows():
-            s = []
-            if pat and r.get(pat): s.append(str(r.get(pat)))
-            if mar and r.get(mar): s.append(str(r.get(mar)))
-            if mod and r.get(mod): s.append(str(r.get(mod)))
-            if fe and r.get(fe):  s.append(f"entrega: {r.get(fe)}")
-            sample.append(" · ".join(s))
-        header = "### Vehículos encontrados\n"
-        bullets = "\n".join([f"- {x}" for x in sample]) if sample else "- (sin vista previa)"
-        text = header + bullets + f"\n**Total vehículos**: {len(res)}"
-        return {"text": text, "df": res}
-
-        if responder_click and pregunta:
-            data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
-            schema = _build_schema(data_filt)
-
-
-# Smart intent: listado de vehículos/OTs, etc. (con try/except para no bloquear)
-smart = None
-try:
-    smart = _smart_list_vehicles(pregunta, data_filt)
-except Exception as e:
-    st.warning(f"Nota: hubo un problema con el listado inteligente: {e}. Sigo con el método estándar.")
+    # 1) Intento de listado inteligente (vehículos/OTs) con fallback seguro
     smart = None
-if smart is not None:
-    with left:
-        render_ia_html_block(prettify_answer(smart["text"]), height=460)
-        _u = st.session_state.get("_last_usage")
-        if _u:
-            st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
-    with right:
-        if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
-            st.markdown("#### Resultado (tabla)")
-            st.dataframe(smart["df"], use_container_width=True, height=460)
-    st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
-    raise st.stop()
-            plan_c = plan_compute_from_llm(pregunta, schema)
-            facts = execute_compute(plan_c, data_filt)
+    try:
+        smart = _smart_list_vehicles(pregunta, data_filt)
+    except Exception as e:
+        st.warning(f"Nota: hubo un problema con el listado inteligente: {e}. Sigo con el método estándar.")
+        smart = None
 
-            if not facts.get("ok"):
-                with left:
-                    st.error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
+    if smart is not None:
+        with left:
+            render_ia_html_block(prettify_answer(smart["text"]), height=460)
+            _u = st.session_state.get("_last_usage")
+            if _u:
+                st.caption(
+                    f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, "
+                    f"completion: {_u.get('completion_tokens', '?')}, "
+                    f"total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}"
+                )
+        with right:
+            if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
+                st.markdown("#### Resultado (tabla)")
+                st.dataframe(smart["df"], use_container_width=True, height=460)
+        st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
+        st.stop()
+
+    # 2) Ruta estándar (plan de cómputo + ejecución)
+    plan_c = plan_compute_from_llm(pregunta, schema)
+    facts = execute_compute(plan_c, data_filt)
+
+    if not facts.get("ok"):
+        with left:
+            st.error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
+            raw = ask_gpt(prompt_consulta_libre(pregunta, schema))
+            render_ia_html_block(raw, height=620)
+            _u = st.session_state.get("_last_usage")
+            if _u:
+                st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+        with right:
+            ok = False
+    else:
+        # Tu lógica actual de pintado (tabla/grafico) con facts
+        with left:
+            texto_left = render_text_from_facts(facts) if 'render_text_from_facts' in globals() else prettify_answer(facts.get("explanation",""))
+            render_ia_html_block(texto_left, height=520)
+            _u = st.session_state.get("_last_usage")
+            if _u:
+                st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+        with right:
+            df_res = facts.get("df_result")
+            if isinstance(df_res, pd.DataFrame) and not df_res.empty:
+                st.dataframe(df_res, use_container_width=True, height=460)
+
+                st.
+error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
                 raw = ask_gpt(prompt_consulta_libre(pregunta, schema))
                 with left:
                     render_ia_html_block(raw, height=620)
@@ -2123,163 +2140,3 @@ elif ss.menu_sel == "Diagnóstico IA":
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
 
 
-
-
-# --- Override de _build_schema para incluir descripciones del DICCIONARIO ---
-def _build_schema(data: Dict[str, Any]) -> Dict[str, Any]:
-    schema = {}
-    role_idx = st.session_state.get("role_index") or {}
-    for hoja, df in (data or {}).items():
-        cols = []; samples = {}; roles = {}
-        if df is not None and not getattr(df, "empty", True):
-            # roles con prioridad al diccionario
-            roles = detect_roles_for_sheet(df, hoja)
-            for c in df.columns:
-                cols.append(str(c))
-                vals = df[c].dropna().astype(str).head(3).tolist()
-                if vals: samples[str(c)] = vals
-        # descripciones desde el diccionario si existen
-        descs = {}
-        for col, meta in (role_idx.get(hoja, {}) or {}).items():
-            if col in (df.columns if df is not None else []):
-                d = str(meta.get("descripcion","")).strip()
-                if d: descs[col] = d
-        schema[hoja] = {"columns": cols, "samples": samples, "roles": roles, "descriptions": descs}
-    return schema
-
-
-
-_EQ_PAT = re.compile(r'([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_ %/#.-]+)\s*[:=]\s*([^\s,;]+)')
-
-def _guess_filters_from_question(q: str, df: pd.DataFrame) -> list[dict]:
-    out = []
-    if not q or df is None or getattr(df, "empty", True): 
-        return out
-    text = q.strip()
-    for m in _EQ_PAT.finditer(text):
-        raw_col = m.group(1).strip()
-        raw_val = m.group(2).strip().strip('"').strip("'")
-        col = find_col(df, raw_col)
-        if col and col in df.columns:
-            out.append({"col": col, "op": "equals", "value": raw_val})
-    return out
-
-
-
-
-# ========================
-# Smart intents (listado)
-# ========================
-import unicodedata
-
-_DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
-
-def _normtxt(s:str)->str:
-    if s is None: return ""
-    s = str(s)
-    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-    return s.lower().strip()
-
-def _find_cols(df, keywords):
-    kw = {_normtxt(k) for k in keywords}
-    found = []
-    for c in df.columns:
-        n = _normtxt(c)
-        if any(k in n for k in kw):
-            found.append(c)
-    return found
-
-def _pick_vehicle_cols(df):
-    # prioridades
-    prefs = [
-        ["PATENTE","PLACA","MATRICULA","MATRÍCULA"],
-        ["MARCA"],
-        ["MODELO"],
-        ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],
-        ["COLOR"],
-        ["AÑO","ANIO"],
-        ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
-        ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],
-        ["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]
-    ]
-    cols = []
-    for group in prefs:
-        got = _find_cols(df, group)
-        if got:
-            # usa solo el primero del grupo para no saturar
-            cols.append(got[0])
-    # fallback
-    if not cols:
-        cols = list(df.columns[:5])
-    return cols[:8]
-
-def _mask_delivered(df):
-    # 1) fecha entrega no nula
-    for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA"]):
-        try:
-            return df[c].notna() & (df[c].astype(str).str.strip()!="")
-        except Exception:
-            pass
-    # 2) estado servicio contiene 'entregado/finalizado'
-    for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA"]):
-        s = df[c].astype(str).map(_normtxt)
-        return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
-    # 3) nada encontrado => True (no filtra por entrega)
-    return pd.Series([True]*len(df))
-
-def _mask_not_invoiced(df):
-    # busca columnas de factura / facturacion
-    cand = _find_cols(df, ["FACTURA","FACTURACION","FACTURACIÓN","N° FACTURA","NUMERO FACTURA","F. FACTURA","FECHA FACTURA","ESTADO FACTURA"])
-    if not cand:
-        return pd.Series([True]*len(df))  # si no hay campos, no filtra
-    m = pd.Series([False]*len(df))
-    for c in cand:
-        s = df[c].astype(str).map(_normtxt)
-        # considera no facturado si está vacío, nulo, 0, 'no', 'pendiente', 'sin', etc.
-        m = m | s.isin({"","nan","none","0","no"}) | s.str.contains("pendient|sin|no fact", na=False)
-    return m
-
-def _smart_list_vehicles(question: str, data: dict):
-    q = _normtxt(question)
-    wants_list = any(w in q for w in ["cuales son","cual es","lista","listado","muestrame","mostrar","detalla","detallar","que vehic", "que autos","vehiculos","vehículo","patentes"])
-    needs_delivered = "entreg" in q
-    needs_not_invoiced = "no han sido factur" in q or ("no" in q and "factur" in q) or "pendient" in q
-
-    if not wants_list:
-        return None  # no interceptamos
-
-    df = data.get("MODELO_BOT")
-    if df is None or df.empty:
-        return None
-
-    mask = pd.Series([True]*len(df))
-    if needs_delivered: mask = mask & _mask_delivered(df)
-    if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
-    res = df.loc[mask].copy()
-    if res.empty:
-        return {"text": "No encontré vehículos con ese criterio.", "df": pd.DataFrame()}
-
-    cols = _pick_vehicle_cols(res)
-    res = res[ [c for c in cols if c in res.columns] ].drop_duplicates().head(200)
-
-    # Arma resumen
-    sample = []
-    # intenta construir 'PATENTE MARCA MODELO' si existen
-    pat = next((c for c in res.columns if _normtxt(c) in {"patente","placa","matricula","matrícula"}), None)
-    mar = next((c for c in res.columns if _normtxt(c)=="marca"), None)
-    mod = next((c for c in res.columns if _normtxt(c)=="modelo"), None)
-    fe = next((c for c in res.columns if "entrega" in _normtxt(c)), None)
-
-    for _,r in res.head(5).iterrows():
-        s = []
-        if pat and r.get(pat): s.append(str(r.get(pat)))
-        if mar and r.get(mar): s.append(str(r.get(mar)))
-        if mod and r.get(mod): s.append(str(r.get(mod)))
-        if fe and r.get(fe):  s.append(f"entrega: {r.get(fe)}")
-        sample.append(" · ".join(s))
-
-    header = "### Vehículos encontrados\n"
-    bullets = "\n".join([f"- {x}" for x in sample]) if sample else "- (sin vista previa)"
-    footer = f"\n**Total vehículos**: {len(res)}"
-    text = header + bullets + "\n" + footer
-    return {"text": text, "df": res}
