@@ -1,283 +1,273 @@
 
-from __future__ import annotations
 import pandas as pd
-import numpy as np
-from typing import Dict, Any, List, Optional, Set
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from typing import Dict, Any, List, Optional
+from datetime import datetime, timezone
 
-_TZ = ZoneInfo("America/Santiago")
-HOY = datetime.now(_TZ).date()
+HOY = pd.Timestamp.now(tz=timezone.utc).tz_convert(None)
 
-# ---------- Normalización ----------
 def _norm(s: str) -> str:
     import unicodedata, re
-    s = str(s) if s is not None else ""
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    s = re.sub(r"\s+", " ", s.strip()).lower()
-    return s
+    if s is None: return ""
+    s = str(s)
+    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return re.sub(r'\s+', ' ', s.strip()).lower()
 
 def _to_local_datetime(s):
-    dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
     try:
-        if getattr(dt.dt, "tz", None) is None:
-            return dt.dt.tz_localize(_TZ, nonexistent="shift_forward", ambiguous="NaT").dt.tz_convert(_TZ)
-        return dt.dt.tz_convert(_TZ)
-    except Exception:
+        dt = pd.to_datetime(s, errors='coerce', dayfirst=True, utc=False)
+        try:
+            dt = dt.dt.tz_localize(None)
+        except Exception:
+            pass
         return dt
+    except Exception:
+        return pd.to_datetime(pd.Series([None]*len(s)))
 
-# ---------- Hints / roles ----------
-ING_HINTS = ["monto","neto","total","importe","facturacion","facturación","ingreso","venta","principal"]
-COST_HINTS = ["costo","costos","gasto","gastos","insumo","insumos","repuesto","repuestos","pintura","material","materiales","mano de obra","mo","imposicion","imposiciones","arriendo","admin","administracion","administración","equipo de planta","generales","financiero","financieros","interes","intereses"]
-ID_HINTS = ["id","folio","factura","documento","nro","número","num","ot","orden","oc","patente","presupuesto"]
-ENTREGA_HINTS = ["fecha entrega","entrega","salida","egreso","término","termino","compromiso","f. entrega"]
-RECEPCION_HINTS = ["fecha rece", "recepción", "recepcion", "ingreso", "entrada", "f. recepcion"]
-SERVICIO_ESTADO_HINTS = ["estado servicio","servicio","estado"]
-PRESUP_ESTADO_HINTS = ["estado presupuesto","presupuesto","aprob","enviado","ganado","perdido"]
-PAGO_HINTS = ["fecha pago","pago","venc","vencimiento","fecha venc","fecha de pago"]
-FACTURA_HINTS = ["factura","n° factura","nro factura","folio","doc","documento"]
-
-# ---------- Diccionario ----------
-def build_role_index(diccionario: pd.DataFrame) -> Dict[str, Dict[str, Dict[str,str]]]:
-    role_idx: Dict[str, Dict[str, Dict[str,str]]] = {}
-    if diccionario is None or diccionario.empty:
-        return role_idx
-    # Permite varios encabezados posibles
-    cols = { _norm(c): c for c in diccionario.columns }
-    def pick(*names):
-        for n in names:
-            if n in cols: return cols[n]
-        return None
-    hoja_c = pick("hoja")
-    col_c  = pick("columna","col")
-    rol_c  = pick("rol")
-    des_c  = pick("descripcion","descripción")
-    alias_c= pick("alias")
-    for _, row in diccionario.iterrows():
-        hoja = str(row.get(hoja_c,"")).strip()
-        col  = str(row.get(col_c,"")).strip()
+def build_role_index(diccionario_df: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    idx: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    if diccionario_df is None or diccionario_df.empty:
+        return idx
+    cols = [c for c in diccionario_df.columns]
+    # Esperamos columnas con al menos: hoja, columna, rol
+    hoja_col = next((c for c in cols if "hoja" in _norm(c)), None)
+    col_col  = next((c for c in cols if "colum" in _norm(c)), None)
+    rol_col  = next((c for c in cols if "rol" in _norm(c)), None)
+    if not (hoja_col and col_col and rol_col):
+        return idx
+    for _, r in diccionario_df.iterrows():
+        hoja = str(r.get(hoja_col, "")).strip()
+        col  = str(r.get(col_col, "")).strip()
+        rol  = str(r.get(rol_col, ""))
         if not hoja or not col: 
             continue
-        meta = {
-            "rol": _norm(str(row.get(rol_c,""))) if rol_c else "",
-            "descripcion": str(row.get(des_c,"")) if des_c else "",
-            "alias": str(row.get(alias_c,"")) if alias_c else ""
-        }
-        role_idx.setdefault(hoja, {})[col] = meta
-    return role_idx
+        idx.setdefault(hoja, {})[col] = {"rol": rol}
+    return idx
 
-def _first_col_by_role_or_hint(df: pd.DataFrame, role_idx, hoja: str, role_subs: List[str], hints: List[str]) -> Optional[str]:
-    # Prefer dictionary
+# ===== KPIs base
+ING_HINTS = ["ingreso", "venta", "monto", "neto", "total", "abono", "bruto"]
+COST_HINTS = ["costo", "coste", "gasto", "egreso", "compra"]
+
+def _find_numeric_cols(df: pd.DataFrame, hints: List[str]) -> List[str]:
+    res = []
+    for c in df.columns:
+        n = _norm(c)
+        if any(h in n for h in hints) and pd.api.types.is_numeric_dtype(df[c]):
+            res.append(c)
+    if not res:
+        # última chance: permitir object convertible
+        for c in df.columns:
+            n = _norm(c)
+            if any(h in n for h in hints):
+                try:
+                    pd.to_numeric(df[c], errors='raise')
+                    res.append(c)
+                except Exception:
+                    pass
+    return list(dict.fromkeys(res))
+
+def analizar_datos_taller(data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    facts: Dict[str, Any] = {}
+    df = data.get("MODELO_BOT")
+    if df is not None and not df.empty:
+        facts["ot_total"] = int(len(df))
+        # Días en planta (si hay), promedio
+        dias_cols = [c for c in df.columns if "dia" in _norm(c) and "plant" in _norm(" ".join(df.columns)) or "planta" in _norm(" ".join(df.columns))]
+        if dias_cols:
+            try:
+                d = pd.to_numeric(df[dias_cols[0]], errors="coerce")
+                facts["dias_promedio"] = float(d.mean(skipna=True))
+            except Exception:
+                pass
+    fz = data.get("FINANZAS")
+    if fz is not None and not fz.empty:
+        ing_cols = _find_numeric_cols(fz, ING_HINTS)
+        cost_cols= _find_numeric_cols(fz, COST_HINTS)
+        ingresos = float(pd.DataFrame({c: pd.to_numeric(fz[c], errors='coerce') for c in ing_cols}).sum(axis=1).sum()) if ing_cols else 0.0
+        costos   = float(pd.DataFrame({c: pd.to_numeric(fz[c], errors='coerce') for c in cost_cols}).sum(axis=1).sum()) if cost_cols else 0.0
+        facts["ingresos_acum"] = ingresos
+        facts["costos_acum"]   = costos
+        facts["margen_acum"]   = ingresos - costos
+    return facts
+
+def narrativa_resumen(facts: Dict[str,Any]) -> str:
+    ot = facts.get("ot_total", 0)
+    dias = facts.get("dias_promedio")
+    ing = facts.get("ingresos_acum", 0.0)
+    cos = facts.get("costos_acum", 0.0)
+    mar = facts.get("margen_acum", ing - cos)
+    partes = [
+        "### Resumen ejecutivo",
+        f"- OT (COUNT): {ot}.",
+        f"- Resultado global (margen): ${int(round(mar)):,}".replace(",", "."),
+        "",
+        "### Diagnóstico",
+        f"- Ingresos acumulados: ${int(round(ing)):,}".replace(",", "."),
+        f"- Costos acumulados: ${int(round(cos)):,}".replace(",", "."),
+    ]
+    if dias is not None:
+        partes.append(f"- Días promedio en planta: {dias:.1f}.")
+    partes += [
+        "",
+        "### Recomendaciones",
+        "- Diseñar campañas sobre las 3 categorías/clientes más frecuentes.",
+        "- Acelerar ventas con mejor conversión y márgenes.",
+        "- Apalancar referidos en categorías con mayor recurrencia.",
+        "",
+        "### Estimaciones y proyecciones",
+        "- Base (siguiente periodo): tendencia simple.",
+        "- Optimista: +10%.",
+        "- Conservador: -10%.",
+        "",
+        "### Riesgos y alertas",
+        "- Concentración en pocas categorías/clientes.",
+        "- Subida de costos impacta margen si no se ajusta precio.",
+        "- Demoras operativas elevan lead time y reducen capacidad efectiva.",
+    ]
+    return "\n".join(partes)
+
+# ===== Entregados no facturados (cruce) — placeholder robusto
+def entregados_no_facturados(data: Dict[str,pd.DataFrame], role_idx: Dict[str,Dict[str,Dict[str,Any]]], days_back: int = 180) -> pd.DataFrame:
+    mb = data.get("MODELO_BOT")
+    if mb is None or mb.empty:
+        return pd.DataFrame()
+    df = mb.copy()
+    # Heurística de columnas
+    entrega_col = next((c for c in df.columns if "entreg" in _norm(c) or ("fecha" in _norm(c) and "entreg" in _norm(c))), None)
+    ot_col = next((c for c in df.columns if _norm(c) in {"ot","# ot","n° ot","numero ot","num ot","nro ot"} or " ot" in _norm(c)), None)
+    factura_cols = [c for c in df.columns if "fact" in _norm(c) or "folio" in _norm(c) or "document" in _norm(c)]
+    if not entrega_col:
+        # nada que filtrar
+        return pd.DataFrame()
+    d = _to_local_datetime(df[entrega_col])
+    mask_deliv = d.notna()
+    if days_back:
+        piso = HOY - pd.Timedelta(days=days_back)
+        mask_deliv &= (d >= piso)
+    # No facturado: si no hay columnas, devolvemos vacío (mejor que falso positivo)
+    if not factura_cols:
+        mask_nf = pd.Series([False]*len(df))
+    else:
+        mask_nf = pd.Series([False]*len(df))
+        for c in factura_cols:
+            s = df[c].astype(str).map(_norm)
+            mask_nf = mask_nf | s.isin({"","nan","none","0","no","false","pendiente","sin","s/factura"}) | s.str.contains("pendient|sin fact|no fact", na=False)
+    res = df.loc[mask_deliv & mask_nf].copy()
+    # Selección de columnas amigables
+    cols = []
+    for pref in [["patente","placa","matric"],["marca"],["modelo"],["cliente","aseguradora"],[entrega_col]]:
+        for c in df.columns:
+            n = _norm(c)
+            if any(p in n for p in pref):
+                cols.append(c)
+                break
+    if ot_col: cols = [ot_col] + cols
+    cols = [c for c in cols if c in df.columns]
+    return res[cols].drop_duplicates()
+
+# ========= Nuevas utilidades para finanzas y proyecciones =========
+
+CLIENTE_HINTS = ["cliente", "razon social", "razón social", "nombre cliente", "asegurado"]
+ASEGURADORA_HINTS = ["aseguradora", "compania", "compañia", "compañía", "cia", "cia."]
+FECHA_HINTS = ["fecha", "fecha doc", "f. doc", "f. emisión", "f. emision", "emision", "emisión", "fecha factura", "fecha venta", "fecha comprobante"]
+
+def _first_date_col(df: pd.DataFrame, role_idx, hoja: str):
     for col, meta in role_idx.get(hoja, {}).items():
         r = _norm(meta.get("rol",""))
-        if any(rs in r for rs in role_subs):
+        if "fecha" in r or "date" in r:
             if col in df.columns: return col
-    # Fallback by header
     for c in df.columns:
-        cc = _norm(c)
-        if any(h in cc for h in hints):
+        if any(h in _norm(c) for h in FECHA_HINTS):
             return c
     return None
 
-def _find_numeric_cols(df: pd.DataFrame, keywords: List[str]):
-    cols = []
+def _group_col(df: pd.DataFrame, role_idx, hoja: str, group: str):
+    hints = ASEGURADORA_HINTS if group=="aseguradora" else CLIENTE_HINTS
+    for col, meta in role_idx.get(hoja, {}).items():
+        r = _norm(meta.get("rol",""))
+        if group in r and col in df.columns:
+            return col
     for c in df.columns:
-        c2 = _norm(c)
-        if any(k in c2 for k in keywords):
-            s = pd.to_numeric(df[c], errors="coerce")
-            if s.notna().sum() > 0:
-                cols.append(c)
-    return cols
-
-# ---------- KPIs base ----------
-def _count_services(df: pd.DataFrame) -> int:
-    for k in ID_HINTS:
-        for c in df.columns:
-            if k in _norm(c):
-                return int(df[c].nunique(dropna=True))
-    ing_cols = _find_numeric_cols(df, ING_HINTS)
-    if ing_cols:
-        s = pd.to_numeric(df[ing_cols[0]], errors="coerce")
-        return int((s > 0).sum())
-    return 0
-
-def _lead_time_days(df: pd.DataFrame):
-    start_keys = ["fecha ingreso","ingreso","recepcion","recepción","entrada"]
-    end_keys   = ["fecha salida","salida","entrega","egreso","termino","término"]
-    start_col = end_col = None
-    for c in df.columns:
-        cc = _norm(c)
-        if not start_col and any(k in cc for k in start_keys): start_col = c
-        if not end_col   and any(k in cc for k in end_keys):   end_col = c
-    if start_col and end_col:
-        s = _to_local_datetime(df[start_col])
-        e = _to_local_datetime(df[end_col])
-        d = (e - s).dt.days
-        d = d[(d.notna()) & (d >= 0) & (d < 365)]
-        if len(d) >= 3:
-            return float(d.median())
+        if any(h in _norm(c) for h in hints):
+            return c
     return None
 
-def analizar_datos_taller(data: Dict[str, pd.DataFrame], cliente_contiene: str = "") -> Dict[str, Any]:
-    """Agrega ingresos/costos y devuelve KPIs generales, hoja por hoja."""
-    total_ing = 0.0; total_cost = 0.0; total_services = 0; lead_time=None
-    hojas = {}
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        ing_cols  = _find_numeric_cols(df, ING_HINTS)
-        cost_cols = _find_numeric_cols(df, COST_HINTS)
-        ing_sum  = float(pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in ing_cols }).sum().sum()) if ing_cols else 0.0
-        cost_sum = float(pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in cost_cols}).sum().sum()) if cost_cols else 0.0
-        total_ing += ing_sum; total_cost += cost_sum; total_services += _count_services(df)
-        lt = _lead_time_days(df); 
-        if lt is not None: lead_time = lt
-        hojas[hoja] = {"filas": int(len(df)), "ing_cols": ing_cols, "cost_cols": cost_cols,
-                       "ingresos_hoja": ing_sum, "costos_hoja": cost_sum}
-    margen = total_ing - total_cost
-    margen_pct = (margen / total_ing * 100.0) if total_ing else 0.0
-    ticket = (total_ing / total_services) if total_services else None
-    return {"fecha_actual": HOY.strftime("%d/%m/%Y"), "ingresos": total_ing, "costos": total_cost,
-            "margen": margen, "margen_pct": round(margen_pct,2), "servicios": total_services,
-            "ticket_promedio": ticket, "lead_time_mediano_dias": lead_time, "hojas": hojas}
+def series_mensual_finanzas(data: Dict[str,pd.DataFrame], role_idx) -> pd.DataFrame:
+    df = data.get("FINANZAS")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["mes","ingresos","costos","margen"])
+    date_col = _first_date_col(df, role_idx, "FINANZAS")
+    ing_cols  = _find_numeric_cols(df, ING_HINTS)
+    cost_cols = _find_numeric_cols(df, COST_HINTS)
+    if not date_col:
+        return pd.DataFrame(columns=["mes","ingresos","costos","margen"])
+    d = _to_local_datetime(df[date_col])
+    x = pd.DataFrame({
+        "fecha": d,
+        "ingresos": pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in ing_cols}).sum(axis=1) if ing_cols else 0.0,
+        "costos": pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in cost_cols}).sum(axis=1) if cost_cols else 0.0,
+    })
+    x["mes"] = x["fecha"].dt.to_period("M").astype(str)
+    g = x.groupby("mes", dropna=True).agg({"ingresos":"sum","costos":"sum"}).reset_index()
+    g["margen"] = g["ingresos"] - g["costos"]
+    return g
 
-# ---------- Estados / consultas ----------
-def _collect_invoice_keys(data: Dict[str,pd.DataFrame], role_idx) -> set:
-    keys = set()
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        has_fact = any(h in _norm(c) for c in df.columns for h in FACTURA_HINTS)
-        if not has_fact:
-            for col, meta in role_idx.get(hoja, {}).items():
-                if "fact" in _norm(meta.get("rol","")): has_fact = True; break
-        if not has_fact: continue
-        id_col = _first_col_by_role_or_hint(df, role_idx, hoja, ["ot","id","orden","patente"], ID_HINTS)
-        if not id_col: continue
-        keys.update(df[id_col].astype(str).str.strip().str.upper().tolist())
-    return keys
-
-def _guess_key_cols(df: pd.DataFrame, role_idx, hoja: str) -> Optional[str]:
-    return _first_col_by_role_or_hint(df, role_idx, hoja, ["ot","id","orden","patente"], ID_HINTS)
-
-def entregas_status(data: Dict[str, pd.DataFrame], dic_idx):
-    filas = []
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        fecha_col = _first_col_by_role_or_hint(df, dic_idx, hoja, ["entrega","salida","egreso"], ENTREGA_HINTS)
-        id_col    = _guess_key_cols(df, dic_idx, hoja)
-        if not fecha_col or not id_col: continue
-        fechas = _to_local_datetime(df[fecha_col]).dt.date
-        dias = (pd.Series(HOY, index=fechas.index) - fechas).dt.days
-        estado = dias.apply(lambda d: "pendiente (futuro)" if pd.notna(d) and d < 0 else ("cumplida" if pd.notna(d) else "sin fecha"))
-        filas.append(pd.DataFrame({"hoja": hoja, "id": df[id_col].astype(str), "fecha_entrega": fechas, "dias_atraso": dias, "estado": estado}))
-    return pd.concat(filas, ignore_index=True) if filas else pd.DataFrame(columns=["hoja","id","fecha_entrega","dias_atraso","estado"])
-
-def facturas_pendientes(data: Dict[str, pd.DataFrame], dic_idx):
-    filas = []
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        pago_col = _first_col_by_role_or_hint(df, dic_idx, hoja, ["pago","venc"], PAGO_HINTS)
-        id_col   = _first_col_by_role_or_hint(df, dic_idx, hoja, ["factura","id","folio","documento"], ID_HINTS)
-        if not pago_col or not id_col: continue
-        fechas = _to_local_datetime(df[pago_col]).dt.date
-        pendientes = df[fechas > HOY]
-        if not pendientes.empty:
-            tmp = pendientes[[id_col]].copy()
-            tmp["hoja"] = hoja; tmp["fecha_pago"] = fechas.loc[pendientes.index]
-            filas.append(tmp.rename(columns={id_col: "id"}))
-    return pd.concat(filas, ignore_index=True) if filas else pd.DataFrame(columns=["id","hoja","fecha_pago"])
-
-def facturas_por_pagar_en_dias(data, dic_idx, dias=30):
-    try:
-        dias = int(dias)
-    except Exception:
-        dias = 30
-    if dias < 1: dias = 1
-    horizon = HOY + timedelta(days=dias)
-    filas = []
-    for hoja, df in (data or {}).items():
-        if df is None or getattr(df, "empty", True): continue
-        pago_col = _first_col_by_role_or_hint(df, dic_idx, hoja, ["pago","venc"], PAGO_HINTS)
-        id_col   = _first_col_by_role_or_hint(df, dic_idx, hoja, ["factura","id","folio","documento"], ID_HINTS)
-        if not pago_col or not id_col: continue
-        fechas = _to_local_datetime(df[pago_col]).dt.date
-        mask = (fechas > HOY) & (fechas <= horizon)
-        sub = df[mask]
-        if sub.empty: continue
-        tmp = sub[[id_col]].copy()
-        tmp["hoja"] = hoja; tmp["fecha_pago"] = fechas.loc[sub.index]
-        filas.append(tmp.rename(columns={id_col: "id"}))
-    return pd.concat(filas, ignore_index=True) if filas else pd.DataFrame(columns=["id","hoja","fecha_pago"])
-
-def entregados_no_facturados(data, dic_idx, days_back: int = 120):
-    """Devuelve entregados en los últimos X días que NO aparecen en ninguna hoja considerada como facturación (según diccionario)."""
-    fact_keys = _collect_invoice_keys(data, dic_idx)
-    filas = []
-    min_date = HOY - timedelta(days=days_back) if days_back else None
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        fecha_col = _first_col_by_role_or_hint(df, dic_idx, hoja, ["entrega","salida","egreso"], ENTREGA_HINTS)
-        id_col    = _guess_key_cols(df, dic_idx, hoja)
-        if not fecha_col or not id_col: continue
-        fechas = _to_local_datetime(df[fecha_col]).dt.date
-        mask_base = fechas.notna() & (fechas <= HOY)
-        if min_date is not None: mask_base &= (fechas >= min_date)
-        ids = df[id_col].astype(str).str.strip().str.upper()
-        mask_no_fact = ~ids.isin(fact_keys)
-        sub = df[mask_base & mask_no_fact].copy()
-        if sub.empty: continue
-        tmp = pd.DataFrame({"hoja": hoja, "id": ids[mask_base & mask_no_fact], "fecha_entrega": fechas[mask_base & mask_no_fact]})
-        filas.append(tmp)
-    return pd.concat(filas, ignore_index=True) if filas else pd.DataFrame(columns=["hoja","id","fecha_entrega"])
-
-def en_taller_con_dias(data, dic_idx, top_n: int = 10):
-    filas = []
-    for hoja, df in (data or {}).items():
-        if df is None or df.empty: continue
-        rec_col   = _first_col_by_role_or_hint(df, dic_idx, hoja, ["recepcion","ingreso","entrada"], RECEPCION_HINTS)
-        ent_col   = _first_col_by_role_or_hint(df, dic_idx, hoja, ["entrega","salida","egreso"], ENTREGA_HINTS)
-        estado_sv = _first_col_by_role_or_hint(df, dic_idx, hoja, ["estado servicio","servicio"], SERVICIO_ESTADO_HINTS)
-        id_col    = _guess_key_cols(df, dic_idx, hoja)
-        if not rec_col or not id_col: continue
-        rec = _to_local_datetime(df[rec_col]).dt.date
-        entregada = _to_local_datetime(df[ent_col]).dt.date if ent_col else pd.Series([pd.NaT]*len(df), index=df.index)
-        mask_no_entrega = entregada.isna()
-        if estado_sv and estado_sv in df.columns:
-            mask_no_entrega |= ~df[estado_sv].astype(str).str.lower().str.contains("entreg", na=False)
-        dias = (pd.Series(HOY, index=rec.index) - rec).dt.days
-        sub = pd.DataFrame({"hoja": hoja, "id": df[id_col].astype(str), "fecha_recepcion": rec, "dias_en_taller": dias})[mask_no_entrega]
-        filas.append(sub.sort_values("dias_en_taller", ascending=False).head(top_n))
-    if not filas:
-        return pd.DataFrame(columns=["hoja","id","fecha_recepcion","dias_en_taller"])
-    return pd.concat(filas, ignore_index=True)
-
-# ---------- Narrativa ejecutiva ----------
-def narrativa_resumen(facts: Dict[str, Any]) -> str:
-    def fmt(x):
-        try: 
-            return f"$ {int(round(float(x))):,}".replace(",", ".")
-        except Exception:
-            return str(x)
-    ingresos = fmt(facts.get("ingresos", 0))
-    costos   = fmt(facts.get("costos", 0))
-    margen   = fmt(facts.get("margen", 0))
-    margen_pct = round(float(facts.get("margen_pct", 0.0)), 2)
-    servicios = int(facts.get("servicios", 0) or 0)
-    lt = facts.get("lead_time_mediano_dias", None)
-    lt_txt = (f"{lt:.0f} días" if isinstance(lt, (int,float)) else "s/d")
-    texto = []
-    texto.append("### Resumen ejecutivo")
-    texto.append(f"- Ingresos: {ingresos}.")
-    texto.append(f"- Costos: {costos}.")
-    texto.append(f"- Margen: {margen} ({margen_pct}%).")
-    texto.append(f"- Servicios/OTs: {servicios}.")
-    texto.append(f"- Lead time mediano: {lt_txt}.")
-    texto.append("\n### Diagnóstico")
-    if margen_pct < 10:
-        texto.append("- Margen bajo: revisar costos y políticas de descuentos.")
+def proyeccion_mes_siguiente(data: Dict[str,pd.DataFrame], role_idx) -> Dict[str,Any]:
+    s = series_mensual_finanzas(data, role_idx)
+    if s.empty:
+        return {"serie": s, "forecast": None}
+    k = 3 if len(s)>=3 else len(s)
+    f_ing = float(s["ingresos"].tail(k).mean())
+    f_cos = float(s["costos"].tail(k).mean())
+    f_mar = f_ing - f_cos
+    last_mes = s["mes"].iloc[-1]
+    y, m = map(int, last_mes.split("-"))
+    if m == 12:
+        y2, m2 = y+1, 1
     else:
-        texto.append("- Margen en rango aceptable, seguir optimizando mezcla de servicios.")
-    texto.append("\n### Recomendaciones")
-    texto.append("- Acciones comerciales en categorías/aseguradoras con mayor recurrencia y ticket.")
-    texto.append("- Priorización operativa de cuellos de botella (etapas con permanencia > p50).")
-    texto.append("- Seguimiento agresivo de entregados sin facturación.")
-    return "\n".join(texto)
+        y2, m2 = y, m+1
+    prox = f"{y2:04d}-{m2:02d}"
+    fc = {"mes": prox, "ingresos": f_ing, "costos": f_cos, "margen": f_mar}
+    return {"serie": s, "forecast": fc}
+
+def ingresos_por_agrupador(data: Dict[str,pd.DataFrame], role_idx, group="aseguradora", months_back: int = 6) -> pd.DataFrame:
+    df = data.get("FINANZAS")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[group,"ingresos"])
+    date_col = _first_date_col(df, role_idx, "FINANZAS")
+    group_col = _group_col(df, role_idx, "FINANZAS", group)
+    ing_cols  = _find_numeric_cols(df, ING_HINTS)
+    if not group_col:
+        return pd.DataFrame(columns=[group,"ingresos"])
+    d = _to_local_datetime(df[date_col]) if date_col else None
+    if months_back and d is not None:
+        piso = (HOY.replace(day=1) - pd.offsets.MonthBegin(months_back)).date()
+        mask = d.dt.date >= piso
+        df = df.loc[mask]
+        if d is not None:
+            d = d.loc[mask]
+    ing = pd.DataFrame({c: pd.to_numeric(df[c], errors="coerce") for c in ing_cols}).sum(axis=1) if ing_cols else pd.Series([0.0]*len(df))
+    g = pd.DataFrame({group: df[group_col].astype(str), "ingresos": ing})
+    g = g.groupby(group, dropna=False)["ingresos"].sum().reset_index().sort_values("ingresos", ascending=False)
+    return g
+
+def narrativa_controller(title: str, facts: Dict[str,Any], bullet_insights: List[str], forecast: Optional[Dict[str,Any]]=None) -> str:
+    base = narrativa_resumen(facts)
+    extra = ["", f"### {title}"]
+    if bullet_insights:
+        extra += [f"- {b}" for b in bullet_insights]
+    if forecast is not None:
+        try:
+            extra.append("")
+            extra.append("### Proyección (próximo mes)")
+            extra.append(f"- Mes: {forecast.get('mes')}")
+            extra.append(f"- Ingresos esperados: ${int(round(forecast.get('ingresos',0))):,}".replace(",", "."))
+            extra.append(f"- Costos esperados: ${int(round(forecast.get('costos',0))):,}".replace(",", "."))
+            extra.append(f"- Margen esperado: ${int(round(forecast.get('margen',0))):,}".replace(",", "."))
+        except Exception:
+            pass
+    extra.append("")
+    extra.append("### Recomendaciones")
+    extra.append("- Concentrar esfuerzo comercial en las cuentas de mayor ticket y conversión.")
+    extra.append("- En operaciones, acelerar cuellos de botella y seguimiento de atrasos.")
+    extra.append("- Finanzas: priorizar cobranza temprana y evitar stockear gastos sin respaldo.")
+    return "\n".join([base] + extra)
