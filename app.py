@@ -54,13 +54,63 @@ def _mask_delivered(df):
         return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
     return pd.Series([True]*len(df))
 
+
 def _mask_not_invoiced(df):
-    cand = _find_cols(df, ["FACTURA","FACTURACION","FACTURACIÓN","N° FACTURA","NUMERO FACTURA","F. FACTURA","FECHA FACTURA","ESTADO FACTURA"])
-    if not cand: return pd.Series([True]*len(df))
+    """
+    Detecta filas NO FACTURADAS con varias heurísticas robustas:
+    - Busca columnas cuyo nombre contenga 'FACT', 'FACTU', 'N° FACT', 'FECHA FACT', 'ESTADO FACT', etc.
+    - Si existe una columna booleana/flag tipo 'FACTURADO', considera False/0/'no'/vacío/'pendiente' como NO facturado.
+    - Si hay columnas de número de factura, toma vacío/0/NaN como NO facturado.
+    - Si no encuentra nada, devuelve True (no filtra).
+    - Además, intenta leer columnas señaladas en DICCIONARIO cuyo rol/descripción mencione 'factur'.
+    """
+    import pandas as pd
+    # 1) Candidatas por nombre
+    name_hits = _find_cols(df, [
+        "FACTURA","FACTURACION","FACTURACIÓN","N° FACT","NRO FACT","NUMERO FACT","NUMERO FACTURA",
+        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT"
+    ])
+    # 2) Por patrón general 'fact' en cualquier columna
+    for c in df.columns:
+        if "fact" in _normtxt(c):
+            if c not in name_hits:
+                name_hits.append(c)
+
+    # 3) Candidatas desde DICCIONARIO (si existe en sesión)
+    try:
+        role_idx = st.session_state.get("role_index") or {}
+        meta_cols = set()
+        for sheet_meta in role_idx.values():
+            for col, meta in (sheet_meta or {}).items():
+                txt = _normtxt(str(meta.get("rol","")) + " " + str(meta.get("descripcion","")))
+                if "fact" in txt and col in df.columns:
+                    meta_cols.add(col)
+        for c in meta_cols:
+            if c not in name_hits:
+                name_hits.append(c)
+    except Exception:
+        pass
+
+    if not name_hits:
+        return pd.Series([True]*len(df))
+
+    # 4) Construye máscara de NO facturado
     m = pd.Series([False]*len(df))
-    for c in cand:
-        s = df[c].astype(str).map(_normtxt)
-        m = m | s.isin({"","nan","none","0","no"}) | s.str.contains("pendient|sin|no fact", na=False)
+    for c in name_hits:
+        s = df[c]
+        # Normaliza a string para evaluar vacíos/pendientes
+        s_norm = s.astype(str).map(_normtxt)
+        # Criterios de "no facturado"
+        m = m | s_norm.isin({"","nan","none","0","no","false"})                 | s_norm.str.contains("pendient|sin|no fact", na=False)
+        # Si es numérico y >0 => facturado; 0 o NaN => no facturado
+        try:
+            snum = pd.to_numeric(s, errors="coerce")
+            m = m | snum.isna() | (snum==0)
+        except Exception:
+            pass
+        # Si parece booleano/flag
+        if str(s.dtype) == "bool":
+            m = m | (~s)
     return m
 
 def _smart_list_vehicles(question: str, data: dict):
@@ -1996,9 +2046,20 @@ if responder_click and pregunta:
                     f"total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}"
                 )
         with right:
-            if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
-                st.markdown("#### Resultado (tabla)")
-                st.dataframe(smart["df"], use_container_width=True, height=460)
+            
+if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
+    st.markdown("#### Resultado (tabla)")
+    df_show = smart["df"].copy()
+    # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
+    for c in df_show.columns:
+        if str(df_show[c].dtype) == "object":
+            try:
+                df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
+            except Exception:
+                pass
+            df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
+    st.dataframe(df_show, use_container_width=True, height=460)
+
         st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
         st.stop()
 
