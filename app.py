@@ -14,7 +14,7 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
 
-from analizador import analizar_datos_taller
+from analizador import analizar_datos_taller, build_role_index
 
 APP_BUILD = "build-2025-09-01-v5-dates"
 FAVICON_PATH = st.secrets.get("FAVICON_PATH", "Isotipo_Nexa.png") or "Isotipo_Nexa.png"
@@ -294,6 +294,33 @@ def load_gsheet(json_keyfile: str, sheet_url: str):
     client = gspread.authorize(creds)
     sheet = client.open_by_url(sheet_url)
     return {ws.title: pd.DataFrame(ws.get_all_records()) for ws in sheet.worksheets()}
+
+# --- Alcance de hojas permitido y rol-index desde DICCIONARIO ---
+_WHITELIST = {"modelo_bot", "diccionario", "finanzas"}
+
+def _only_whitelisted_sheets(all_data: dict) -> dict:
+    out = {}
+    for name, df in (all_data or {}).items():
+        if str(name).strip().lower() in _WHITELIST:
+            out[name] = df.copy()
+    # Garantiza existencia de llaves aunque vengan vacías
+    for must in ["MODELO_BOT","DICCIONARIO","FINANZAS"]:
+        if must not in out:
+            out[must] = out.get(must, out.get(must.title(), pd.DataFrame())) if isinstance(out.get(must), pd.DataFrame) else pd.DataFrame()
+    return out
+
+def _build_role_index_from_state(data_dict: dict) -> dict:
+    try:
+        dic_df = None
+        # Buscar 'DICCIONARIO' con tolerancia
+        for k,v in (data_dict or {}).items():
+            if str(k).strip().lower() == "diccionario":
+                dic_df = v; break
+        if dic_df is None or getattr(dic_df, "empty", True):
+            return {}
+        return build_role_index(dic_df)
+    except Exception:
+        return {}
 
 # ======== OpenAI ========
 def _get_openai_client():
@@ -1344,6 +1371,13 @@ Esquema (con roles):
 Pregunta:
 {pregunta}
 
+Formato de salida obligado en bullets:
+- Resumen ejecutivo.
+- Diagnóstico (qué pasa y por qué).
+- Recomendaciones accionables (priorizadas).
+- Estimaciones y proyecciones (base/optimista/conservador si aplica).
+- Riesgos y alertas (con mitigaciones).
+
 {ANALYSIS_FORMAT}
 """
     return [{"role":"system","content":system}, *historial_msgs, {"role":"user","content":user}]
@@ -1492,6 +1526,13 @@ def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
         crow = plan_c.get("category_col") or ""
         ccol = find_col(df, crow) if crow else None
         filters = plan_c.get("filters") or []
+        # Inyecta filtros inferidos desde la pregunta si aplica
+        try:
+            auto_filters = _guess_filters_from_question(plan_c.get("question",""), df)
+            if auto_filters:
+                filters = (filters or []) + auto_filters
+        except Exception:
+            pass
         op = (plan_c.get("op") or "sum").lower()
 
         vrole = roles.get(vcol, "unknown")
@@ -1714,6 +1755,8 @@ if ss.menu_sel == "Datos":
         file = st.file_uploader("Sube un Excel", type=["xlsx","xls"])
         if file:
             ss.data = load_excel(file)
+            ss.data = _only_whitelisted_sheets(ss.data)
+            st.session_state['role_index'] = _build_role_index_from_state(ss.data)
             st.success("Excel cargado.")
     else:
         with st.form(key="form_gsheet"):
@@ -1722,6 +1765,8 @@ if ss.menu_sel == "Datos":
         if conectar and url:
             try:
                 ss.data = load_gsheet(st.secrets["GOOGLE_CREDENTIALS"], url)
+                ss.data = _only_whitelisted_sheets(ss.data)
+                st.session_state['role_index'] = _build_role_index_from_state(ss.data)
                 ss.sheet_url = url
                 st.success("Google Sheet conectado.")
             except Exception as e:
@@ -1977,5 +2022,47 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
+
+
+
+# --- Override de _build_schema para incluir descripciones del DICCIONARIO ---
+def _build_schema(data: Dict[str, Any]) -> Dict[str, Any]:
+    schema = {}
+    role_idx = st.session_state.get("role_index") or {}
+    for hoja, df in (data or {}).items():
+        cols = []; samples = {}; roles = {}
+        if df is not None and not getattr(df, "empty", True):
+            # roles con prioridad al diccionario
+            roles = detect_roles_for_sheet(df, hoja)
+            for c in df.columns:
+                cols.append(str(c))
+                vals = df[c].dropna().astype(str).head(3).tolist()
+                if vals: samples[str(c)] = vals
+        # descripciones desde el diccionario si existen
+        descs = {}
+        for col, meta in (role_idx.get(hoja, {}) or {}).items():
+            if col in (df.columns if df is not None else []):
+                d = str(meta.get("descripcion","")).strip()
+                if d: descs[col] = d
+        schema[hoja] = {"columns": cols, "samples": samples, "roles": roles, "descriptions": descs}
+    return schema
+
+
+
+_EQ_PAT = re.compile(r'([A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9_ %/#.-]+)\s*[:=]\s*([^\s,;]+)')
+
+def _guess_filters_from_question(q: str, df: pd.DataFrame) -> list[dict]:
+    out = []
+    if not q or df is None or getattr(df, "empty", True): 
+        return out
+    text = q.strip()
+    for m in _EQ_PAT.finditer(text):
+        raw_col = m.group(1).strip()
+        raw_val = m.group(2).strip().strip('"').strip("'")
+        col = find_col(df, raw_col)
+        if col and col in df.columns:
+            out.append({"col": col, "op": "equals", "value": raw_val})
+    return out
 
 
