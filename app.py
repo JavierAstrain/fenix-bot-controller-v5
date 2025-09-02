@@ -2022,6 +2022,16 @@ elif ss.menu_sel == "Consulta IA":
 
         
 # ------- Responder (junto a la pregunta) -------
+
+# -- Safe defaults for responder_click/pregunta (avoid NameError when not on the Consulta IA tab)
+try:
+    responder_click
+except NameError:
+    responder_click = False
+try:
+    pregunta
+except NameError:
+    pregunta = ""
 if responder_click and pregunta:
     # Prepara datos y esquema (si la pregunta trae fechas, filtramos)
     data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
