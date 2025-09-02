@@ -1097,7 +1097,7 @@ def mostrar_tabla(df, col_categoria, col_valor, titulo=None):
     total_val = vals.sum(skipna=True)
     resumen.loc[len(resumen)] = ["TOTAL", fmt_money(total_val)]
     st.markdown(f"### 📊 {titulo if titulo else f'{col_val} por {col_categoria}'}")
-    st.dataframe(resumen, use_container_width=True)
+    st.dataframe(_safe_df_for_streamlit(resumen), use_container_width=True)
     st.download_button("⬇️ Descargar tabla (CSV)",
                        resumen.to_csv(index=False).encode("utf-8"),
                        "tabla.csv", "text/csv",
@@ -1112,7 +1112,7 @@ def mostrar_tabla_count(g: pd.DataFrame, cat_col: str, count_col: str, titulo: s
     df_total = pd.DataFrame([{"Categoría":"TOTAL","OCs/OTs": total}])
     tabla = pd.concat([df, df_total], ignore_index=True)
     st.markdown(f"### 📋 {titulo}")
-    st.dataframe(tabla, use_container_width=True)
+    st.dataframe(_safe_df_for_streamlit(tabla), use_container_width=True)
     st.download_button("⬇️ Descargar tabla (CSV)",
                        tabla.to_csv(index=False).encode("utf-8"),
                        "tabla.csv", "text/csv",
@@ -1274,7 +1274,7 @@ def render_finance_table(data: Dict[str, pd.DataFrame]) -> None:
     margen = ingresos - costos
     df_tab = pd.DataFrame({"Concepto":["Ingresos","Costos","Margen"], "Monto":[ingresos,costos,margen]})
     df_tab["Monto"] = df_tab["Monto"].apply(fmt_money)
-    st.dataframe(df_tab, use_container_width=True)
+    st.dataframe(_safe_df_for_streamlit(df_tab), use_container_width=True)
 
 # ======== Pair finders ========
 def find_best_pair_money(data: Dict[str, pd.DataFrame], category_match: callable):
@@ -2213,14 +2213,8 @@ if responder_click and pregunta:
                 st.markdown("#### Resultado (tabla)")
                 df_show = smart["df"].copy()
                 # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
-                for c in df_show.columns:
-                    if str(df_show[c].dtype) == "object":
-                        try:
-                            df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
-                        except Exception:
-                            pass
-                        df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
-                st.dataframe(df_show, use_container_width=True, height=460)
+                df_show = _safe_df_for_streamlit(df_show)
+                st.dataframe(_safe_df_for_streamlit(df_show), use_container_width=True, height=460)
 
         st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
         st.stop()
@@ -2266,19 +2260,19 @@ if responder_click and pregunta:
                                 else:
                                     df_show["Valor"] = df_show["Valor"].apply(fmt_money)
                                 st.markdown("### 📋 Resultado")
-                                st.dataframe(df_show, use_container_width=True)
+                                st.dataframe(_safe_df_for_streamlit(df_show), use_container_width=True)
                                 st.download_button("⬇️ Descargar tabla (CSV)",
                                                    df_show.to_csv(index=False).encode("utf-8"),
                                                    "resultado.csv","text/csv", key=_unique_key("csv"))
                         except Exception as e:
                             st.error(f"Error graficando: {e}")
-                            st.dataframe(df_res, use_container_width=True)
+                            st.dataframe(_safe_df_for_streamlit(df_res), use_container_width=True)
                     else:
                         role = facts.get("value_role","unknown")
                         valtxt = (fmt_money(facts['total']) if role=="money" and facts.get("op","sum")!="count"
                                   else _fmt_number_general(facts['total']))
                         st.metric(f"{facts['op'].upper()} de {facts['value_col']}", valtxt)
-                        st.dataframe(df_res, use_container_width=True)
+                        st.dataframe(_safe_df_for_streamlit(df_res), use_container_width=True)
                     st.caption(f"Hoja: {facts['sheet']} • Filas: {facts['rows']}")
                 ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
 
@@ -2300,7 +2294,7 @@ elif ss.menu_sel == "Uso de Tokens":
     if _df_tok.empty:
         st.info("Sin registros todavía. A medida que hagas consultas o análisis se guardará aquí el uso.")
     else:
-        st.dataframe(_df_tok.sort_values("ts", ascending=False), use_container_width=True)
+        st.dataframe(_safe_df_for_streamlit(_df_tok.sort_values("ts"), ascending=False), use_container_width=True)
         st.metric("Consultas registradas", int(len(_df_tok)))
         if "total_tokens" in _df_tok:
             st.metric("Total de tokens", int(pd.to_numeric(_df_tok["total_tokens"], errors="coerce").sum()))
