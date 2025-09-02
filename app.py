@@ -1895,7 +1895,7 @@ elif ss.menu_sel == "Consulta IA":
                 render_ia_html_block(prettify_answer(raw) + "\n\n" + texto_extra, height=520)
                 _u = st.session_state.get('_last_usage')
                 if _u:
-                    st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                    st.caption("")
             with right:
                 render_finance_table(data)
                 st.markdown("### Distribución por cliente y procesos")
@@ -2013,47 +2013,16 @@ if responder_click and pregunta:
             render_ia_html_block(raw, height=620)
             _u = st.session_state.get("_last_usage")
             if _u:
-                st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                st.caption("")
         with right:
             ok = False
     else:
-        # Tu lógica actual de pintado (tabla/grafico) con facts
-        with left:
-            texto_left = render_text_from_facts(facts) if 'render_text_from_facts' in globals() else prettify_answer(facts.get("explanation",""))
-            render_ia_html_block(texto_left, height=520)
-            _u = st.session_state.get("_last_usage")
-            if _u:
-                st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
-        with right:
-            df_res = facts.get("df_result")
-            if isinstance(df_res, pd.DataFrame) and not df_res.empty:
-                st.dataframe(df_res, use_container_width=True, height=460)
-
-                st.
-error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
-                raw = ask_gpt(prompt_consulta_libre(pregunta, schema))
-                with left:
-                    render_ia_html_block(raw, height=620)
-                    _u = st.session_state.get("_last_usage")
-                    if _u:
-                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
-                with right:
-                    ok = False
-                    try:
-                        plan = plan_from_llm(pregunta, schema)
-                        ok = execute_plan(plan, data_filt)
-                    except Exception as e:
-                        st.error(f"Error ejecutando plan: {e}")
-                    if not ok:
-                        st.info("Sin visual sugerida para esta consulta.")
-                ss.historial.append({"pregunta":pregunta,"respuesta":raw})
-            else:
                 texto_left = compose_focus_text(facts, pregunta)
                 with left:
                     render_ia_html_block(texto_left, height=520)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                        st.caption("")
                 with right:
                     df_res = facts["df_result"]
                     if facts.get("category_col"):
@@ -2138,5 +2107,3 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
-
-
