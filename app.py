@@ -1917,7 +1917,7 @@ elif ss.menu_sel == "Consulta IA":
                     render_ia_html_block(prettify_answer(smart["text"]), height=460)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                    st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
                     if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
                     st.markdown("#### Resultado (tabla)")
