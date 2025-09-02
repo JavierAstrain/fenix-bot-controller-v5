@@ -1,3 +1,135 @@
+
+# ---------- Safe dataframe sanitizer for Streamlit ----------
+def _safe_df_for_streamlit(df):
+    import pandas as pd
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [' / '.join(map(str, tup)) for tup in out.columns.to_list()]
+    try:
+        from pandas.io.parsers import ParserBase
+        out.columns = ParserBase({'names': out.columns})._maybe_dedup_names(out.columns)
+    except Exception:
+        pass
+    for col in list(out.columns):
+        s = out[col]
+        if isinstance(s, pd.DataFrame):
+            try:
+                out[col] = s.astype(str).agg(' | '.join, axis=1)
+            except Exception:
+                out[col] = s.astype(str).fillna('')
+            continue
+        if str(s.dtype) == 'object':
+            try:
+                import pandas as pd
+                s_dt = pd.to_datetime(s, errors='coerce', dayfirst=True)
+                if s_dt.notna().sum() > 0:
+                    out[col] = s_dt
+                    continue
+            except Exception:
+                pass
+            out[col] = s.apply(lambda v: v if isinstance(v,(int,float,str,bool,type(None))) else str(v))
+    return out
+
+# ========= Smart listing helpers (vehículos/OTs) =========
+def _find_cols(df, keywords):
+    kw = {_normtxt(k) for k in keywords}
+    found = []
+    for c in df.columns:
+        n = _normtxt(c)
+        if any(k in n for k in kw):
+            found.append(c)
+    return found
+
+def _pick_vehicle_cols(df):
+    prefs = [
+        ["PATENTE","PLACA","MATRICULA","MATRÍCULA"],
+        ["MARCA"], ["MODELO"],
+        ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],
+        ["COLOR"], ["AÑO","ANIO"],
+        ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
+        ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],
+        ["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]
+    ]
+    cols = []
+    for group in prefs:
+        got = _find_cols(df, group)
+        if got: cols.append(got[0])
+    if not cols: cols = list(df.columns[:6])
+    return cols[:10]
+
+_DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
+
+def _mask_delivered(df):
+    for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA","SALIDA","EGRESO","TERMINO","TÉRMINO"]):
+        try:
+            return df[c].notna() & (df[c].astype(str).str.strip()!="")
+        except Exception:
+            pass
+    for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA","SITUACION","SITUACIÓN"]):
+        s = df[c].astype(str).map(_normtxt)
+        return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
+    return pd.Series([True]*len(df))
+
+def _mask_not_invoiced(df):
+    cand = _find_cols(df, [
+        "FACTURA","FACTURACION","FACTURACIÓN","N° FACT","NRO FACT","NUMERO FACT","NUMERO FACTURA",
+        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT"
+    ])
+    for c in df.columns:
+        if 'fact' in _normtxt(c) and c not in cand:
+            cand.append(c)
+    if not cand:
+        return pd.Series([True]*len(df))
+    m = pd.Series([False]*len(df))
+    for c in cand:
+        s = df[c]
+        s_norm = s.astype(str).map(_normtxt)
+        m = m | s_norm.isin({'','nan','none','0','no','false'}) | s_norm.str_contains('pendient|sin|no fact', na=False) if hasattr(s_norm, 'str_contains') else m | s_norm.str.contains('pendient|sin|no fact', na=False)
+        try:
+            import pandas as pd
+            snum = pd.to_numeric(s, errors='coerce')
+            m = m | snum.isna() | (snum==0)
+        except Exception:
+            pass
+        if str(s.dtype) == 'bool':
+            m = m | (~s)
+    return m
+
+def _smart_list_vehicles(question: str, data: dict):
+    q = _normtxt(question)
+    wants_list = any(w in q for w in ['cuales son','cuáles son','cual es','cuál es','lista','listado','muestrame','muéstrame','mostrar','detalla','detallar','que vehic','qué vehic','que autos','qué autos','vehiculos','vehículos','patentes'])
+    needs_delivered = 'entreg' in q
+    needs_not_invoiced = ('no han sido factur' in q) or ((' no ' in f' {q} ') and ('factur' in q)) or ('pendient' in q)
+    if not wants_list:
+        return None
+    df = data.get('MODELO_BOT')
+    if df is None or df.empty:
+        return None
+    mask = pd.Series([True]*len(df))
+    if needs_delivered: mask = mask & _mask_delivered(df)
+    if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
+    res = df.loc[mask].copy()
+    if res.empty:
+        return {'text':'No encontré vehículos con ese criterio.', 'df': pd.DataFrame()}
+    cols = _pick_vehicle_cols(res)
+    res = res[[c for c in cols if c in res.columns]].drop_duplicates().head(300)
+    pat = next((c for c in res.columns if _normtxt(c) in {'patente','placa','matricula','matrícula'}), None)
+    mar = next((c for c in res.columns if _normtxt(c)=='marca'), None)
+    mod = next((c for c in res.columns if _normtxt(c)=='modelo'), None)
+    fe  = next((c for c in res.columns if 'entrega' in _normtxt(c)), None)
+    preview = []
+    for _, r in res.head(5).iterrows():
+        s = []
+        if pat and r.get(pat): s.append(str(r.get(pat)))
+        if mar and r.get(mar): s.append(str(r.get(mar)))
+        if mod and r.get(mod): s.append(str(r.get(mod)))
+        if fe and r.get(fe):  s.append(f'entrega: {r.get(fe)}')
+        if s: preview.append(' · '.join(s))
+    header = '### Vehículos encontrados\n'
+    bullets = '\n'.join([f'- {x}' for x in preview]) if preview else '- (sin vista previa)'
+    text = header + bullets + f'\n\nTotal vehículos: {len(res)}'
+    return {'text': text, 'df': res}
+
 # app.py
 # Controller Financiero IA — build: 2025-08-27 focus-v7b
 
@@ -2022,17 +2154,37 @@ elif ss.menu_sel == "Consulta IA":
 
         
 # ------- Responder (junto a la pregunta) -------
-
-# -- Safe defaults for responder_click/pregunta (avoid NameError when not on the Consulta IA tab)
 try:
     responder_click
 except NameError:
-    responder_click = False
+    responder_click=False
 try:
     pregunta
 except NameError:
-    pregunta = ""
+    pregunta=''
 if responder_click and pregunta:
+    _ALLOWED={'MODELO_BOT','FINANZAS','DICCIONARIO'}
+    data_allowed={k:v for k,v in (data or {}).items() if k in _ALLOWED}
+    # Smart intent: entregados no facturados con cruce inter-hojas
+    qn=_normtxt(pregunta)
+    try:
+        from analizador_v2 import build_role_index, entregados_no_facturados, narrativa_resumen, analizar_datos_taller
+        diccionario_df=data_allowed.get('DICCIONARIO') if isinstance(data_allowed.get('DICCIONARIO'), pd.DataFrame) else None
+        dic_idx=build_role_index(diccionario_df) if diccionario_df is not None else {}
+        if ('entreg' in qn) and (('no han sido factur' in qn) or ('sin factur' in qn) or ('pendient' in qn)):
+            df_nf=entregados_no_facturados(data_allowed, dic_idx, days_back=180)
+            if isinstance(df_nf, pd.DataFrame) and not df_nf.empty:
+                facts=analizar_datos_taller({k:v for k,v in data_allowed.items() if k!='DICCIONARIO'})
+                left_text=narrativa_resumen(facts)+"\n\n**Consulta**: Vehículos entregados sin facturar (últimos 180 días)."
+                with left:
+                    render_ia_html_block(prettify_answer(left_text), height=520)
+                with right:
+                    st.markdown('#### Resultado (tabla)')
+                    st.dataframe(_safe_df_for_streamlit(df_nf), use_container_width=True, height=460)
+                st.session_state.historial.append({'pregunta':pregunta,'respuesta':left_text})
+                st.stop()
+    except Exception: pass
+
     # Prepara datos y esquema (si la pregunta trae fechas, filtramos)
     data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
     schema = _build_schema(data_filt)
