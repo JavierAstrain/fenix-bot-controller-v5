@@ -2047,18 +2047,18 @@ if responder_click and pregunta:
                 )
         with right:
             
-if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
-    st.markdown("#### Resultado (tabla)")
-    df_show = smart["df"].copy()
-    # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
-    for c in df_show.columns:
-        if str(df_show[c].dtype) == "object":
-            try:
-                df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
-            except Exception:
-                pass
-            df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
-    st.dataframe(df_show, use_container_width=True, height=460)
+            if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
+                st.markdown("#### Resultado (tabla)")
+                df_show = smart["df"].copy()
+                # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
+                for c in df_show.columns:
+                    if str(df_show[c].dtype) == "object":
+                        try:
+                            df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
+                        except Exception:
+                            pass
+                        df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
+                st.dataframe(df_show, use_container_width=True, height=460)
 
         st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
         st.stop()
