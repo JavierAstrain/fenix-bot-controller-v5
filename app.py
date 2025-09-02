@@ -13,11 +13,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from streamlit.components.v1 import html as st_html
-from analizador import (
-    HOY, build_role_index, entregas_status, facturas_pendientes, facturas_por_pagar_en_dias,
-    entregados_no_facturados, en_taller_con_dias, entregas_proximos_dias_sin_factura, sin_aprobacion_presupuesto
-)
-
 
 from analizador import analizar_datos_taller
 
@@ -1790,7 +1785,7 @@ elif ss.menu_sel == "Consulta IA":
                 render_ia_html_block(prettify_answer(raw) + "\n\n" + texto_extra, height=520)
                 _u = st.session_state.get('_last_usage')
                 if _u:
-                    st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
+                    st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
             with right:
                 render_finance_table(data)
                 st.markdown("### Distribución por cliente y procesos")
@@ -1867,41 +1862,6 @@ elif ss.menu_sel == "Consulta IA":
 
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
-
-            # === Fallback determinístico para "facturas a pagar en los próximos días" ===
-            try:
-                _dic = data.get("DICCIONARIO") if isinstance(data, dict) else None
-                _role_idx = build_role_index(_dic) if _dic is not None else {}
-            except Exception:
-                _role_idx = {}
-            _q = str(pregunta).lower()
-            import re
-            _win_days = 30
-            m = re.search(r"pr[oó]xim[oa]s?\s+(\d+)\s+d[ií]as", _q)
-            if m:
-                _win_days = int(m.group(1))
-            else:
-                m = re.search(r"pr[oó]xim[oa]s?\s+(\d+)\s+semanas", _q)
-                if m:
-                    _win_days = int(m.group(1)) * 7
-                else:
-                    m = re.search(r"pr[oó]xim[oa]s?\s+(\d+)\s+mes", _q)
-                    if m:
-                        _win_days = int(m.group(1)) * 30
-            _is_upcoming_pay = ("factur" in _q) and (("pagar" in _q) or ("por pagar" in _q) or ("venc" in _q) or ("próxim" in _q) or ("proxim" in _q) or ("pendiente" in _q))
-            if _is_upcoming_pay:
-                _dfp = facturas_por_pagar_en_dias(data, _role_idx, _win_days) if ("próxim" in _q or "proxim" in _q) else facturas_pendientes(data, _role_idx)
-                import pandas as _pd
-                st.markdown("### Facturas por pagar (ventana próxima)")
-                if _dfp is None or _dfp.empty:
-                    st.info("No hay facturas por pagar en la ventana solicitada.")
-                else:
-                    _dfp = _dfp.sort_values("fecha_pago")
-                    _dfp["fecha_pago"] = _pd.to_datetime(_dfp["fecha_pago"]).dt.strftime("%d/%m/%Y")
-                    st.dataframe(_dfp, use_container_width=True, hide_index=True)
-                    st.caption(f"Total: {len(_dfp)} · Ventana: {_win_days} días desde {HOY.strftime('%d/%m/%Y')}")
-                st.stop()
-
             data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
             schema = _build_schema(data_filt)
             plan_c = plan_compute_from_llm(pregunta, schema)
@@ -1915,7 +1875,7 @@ elif ss.menu_sel == "Consulta IA":
                     render_ia_html_block(raw, height=620)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
+                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
                     ok = False
                     try:
@@ -1932,7 +1892,7 @@ elif ss.menu_sel == "Consulta IA":
                     render_ia_html_block(texto_left, height=520)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption(f"Uso de tokens — total: {_u.get('total_tokens','?')} · prompt: {_u.get('prompt_tokens','?')} · completion: {_u.get('completion_tokens','?')} · modelo: {_u.get('model','?')}")
+                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
                     df_res = facts["df_result"]
                     if facts.get("category_col"):
@@ -2017,4 +1977,5 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
 
