@@ -1355,8 +1355,7 @@ def make_system_prompt():
             "Responde SIEMPRE con estilo ejecutivo + analítico y basándote EXCLUSIVAMENTE en la planilla.")
     hint = ss.get('_dictionary_hint')
     if hint:
-        base += "
-Diccionario de columnas (resumen): " + hint
+        base += "\nDiccionario de columnas (resumen): " + hint
     return base
 
 ANALYSIS_FORMAT = """
