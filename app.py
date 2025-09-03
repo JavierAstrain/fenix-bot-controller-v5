@@ -981,6 +981,83 @@ def normalize_df_result(df: pd.DataFrame, facts: dict) -> pd.DataFrame:
         if cand:
             out = out.rename(columns={cand:"VALOR"})
     return out
+
+# ===== Special deterministic handler: delivered but not invoiced =====
+def _special_unbilled_delivered(pregunta:str, data:dict, schema:dict, left, right) -> bool:
+    q = _norm(pregunta)
+    triggers = ["sin facturar","no facturad","no han sido factura","pendientes de facturar","por facturar"]
+    if not any(t in q for t in triggers):
+        return False
+    if "MODELO_BOT" not in data:
+        return False
+
+    dfm = data.get("MODELO_BOT", pd.DataFrame()).copy()
+    dff = data.get("FINANZAS", pd.DataFrame()).copy()
+
+    if dfm.empty:
+        return False
+
+    roles_m = schema.get("MODELO_BOT",{}).get("roles",{}) or detect_roles_for_sheet(dfm, "MODELO_BOT")
+    roles_f = schema.get("FINANZAS",{}).get("roles",{}) or (detect_roles_for_sheet(dff, "FINANZAS") if not dff.empty else {})
+
+    # Prefer join key: OT -> PATENTE
+    key_m = None
+    for k,r in roles_m.items():
+        if r=="id" and "ot" in _norm(k):
+            key_m = k; break
+    if not key_m:
+        for k,r in roles_m.items():
+            if r=="id" and "patente" in _norm(k):
+                key_m = k; break
+    if not key_m:
+        return False
+
+    # find matching key in FINANZAS
+    key_f = None
+    for k,r in roles_f.items():
+        if r=="id" and _norm(k)==_norm(key_m):
+            key_f = k; break
+    if not key_f:
+        for k,r in roles_f.items():
+            if r=="id" and (("patente" in _norm(k) and "patente" in _norm(key_m)) or ("ot" in _norm(k) and "ot" in _norm(key_m))):
+                key_f = k; break
+
+    # Fecha de entrega en MODELO_BOT
+    date_entrega = None
+    for k,r in roles_m.items():
+        if r=="date" and ("entrega" in _norm(k) or "egreso" in _norm(k) or "salida" in _norm(k)):
+            date_entrega = k; break
+    if not date_entrega:
+        for k,r in roles_m.items():
+            if r=="date": date_entrega = k; break
+
+    # Filtrar entregados
+    dffm = dfm.copy()
+    if date_entrega in dffm.columns:
+        _dtv = pd.to_datetime(dffm[date_entrega], errors="coerce")
+        dffm = dffm[_dtv.notna()]
+    if dffm.empty:
+        return False
+
+    # Anti-join contra FINANZAS si es posible
+    if not dff.empty and key_f and key_f in dff.columns:
+        keys_fin = set(dff[key_f].dropna().astype(str).str.strip().unique().tolist())
+        dffm = dffm[~dffm[key_m].astype(str).str.strip().isin(keys_fin)]
+
+    # Campos para mostrar
+    cols = [c for c in [key_m, date_entrega, find_col(dffm, "patente"), find_col(dffm, "cliente"), find_col(dffm, "modelo")] if c and c in dffm.columns]
+    df_show = dffm[cols].copy() if cols else dffm.head(100).copy()
+
+    with left:
+        st.markdown("### Vehículos entregados **sin facturar**")
+        st.write(f"Total: **{len(df_show)}**")
+        st.caption("Cálculo determinístico: entregados (fecha de entrega no vacía) menos claves presentes en FINANZAS.")
+    with right:
+        st.dataframe(df_show, use_container_width=True)
+        st.download_button("⬇️ Descargar listado (CSV)", df_show.to_csv(index=False).encode("utf-8"), "entregados_no_facturados.csv","text/csv", key=_unique_key("csv"))
+    return True
+
+
 def mostrar_grafico_barras_v3(df, col_categoria, col_valor, titulo=None):
     vals = pd.to_numeric(df[col_valor], errors="coerce")
     resumen = (df.assign(__v=vals)
@@ -1533,88 +1610,6 @@ PREGUNTA:
     try: return json.loads(m.group(0))
     except Exception: return {}
 
-
-# ======== Planner (rules) ========
-def plan_from_rules(pregunta: str, schema: dict) -> dict:
-    """
-    Planificador basado en reglas para cubrir intents frecuentes.
-    Si no encuentra patrón, devuelve {} (fallback al planner LLM).
-    """
-    import unicodedata, re as _re
-    def _norm(s: str) -> str:
-        s = str(s or '').replace("\u00A0"," ").strip()
-        s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-        s = _re.sub(r'\s+',' ', s)
-        return s.lower()
-
-    qn = _norm(pregunta or "")
-    if not schema: 
-        return {}
-
-    # Escoger hoja por defecto
-    def _pick_sheet():
-        for h in schema.keys():
-            if _norm(h) in ("modelo_bot","modelo bot","modelo-bot"):
-                return h
-        for h in schema.keys():
-            if "finanz" not in _norm(h):
-                return h
-        return list(schema.keys())[0]
-
-    sheet = _pick_sheet()
-    roles = schema.get(sheet, {}).get("roles", {})
-
-    def _find_col_by_keywords(keywords, prefer_roles=()):
-        prefer_roles = set(prefer_roles or [])
-        cand = []
-        for c, r in roles.items():
-            cn = _norm(c)
-            if any(k in cn for k in keywords):
-                cand.append((c, r))
-        if prefer_roles and cand:
-            pr = [c for c, r in cand if r in prefer_roles]
-            if pr: return pr[0]
-        return cand[0][0] if cand else None
-
-    def _first_role(role_name, alt_keywords=None):
-        for c, r in roles.items():
-            if r == role_name: return c
-        return _find_col_by_keywords(alt_keywords or []) if alt_keywords else None
-
-    id_col      = _first_role("id")    or _find_col_by_keywords(["ot","orden","folio","documento","nro","numero","num"])
-    money_col   = _first_role("money", ["monto","valor","total","neto","bruto","pago","precio"])
-    date_col    = _first_role("date",  ["fecha","emision","ingreso","salida","entrega","factura"])
-    patente_col = _find_col_by_keywords(["patente","placa","matricula","chasis","vin"])
-    cliente_col = _find_col_by_keywords(["cliente","razon social","razón social","nombre cliente"])
-    estado_col  = _find_col_by_keywords(["estado","etapa","workflow","fase","situacion","situación","proceso","servicio"])
-    factura_col = _find_col_by_keywords(["factura","boleta","nº factura","numero de factura","número de factura","nro factura","doc tributario","facturacion","facturación"])
-
-    # Entregados sin facturar
-    if any(w in qn for w in ("no han sido factur","no facturad","por facturar","pendiente de factur","sin facturar")):
-        filters = []
-        if factura_col:
-            filters.append({"col": factura_col, "op":"isnull", "val": ""})
-        if any(k in qn for k in ("entregad","salid","egres")):
-            if estado_col:
-                filters.append({"col": estado_col, "op":"contains", "val":"entrega"})
-        val = id_col or patente_col or cliente_col or money_col or ""
-        return {"sheet": sheet, "value_col": val, "category_col": patente_col or cliente_col or "",
-                "op": "count" if (val==id_col or roles.get(val) in ("id","text","category")) else "sum",
-                "filters": filters, "group_by": "none"}
-
-    # Montos / ingresos
-    if any(w in qn for w in ("monto","ingreso","venta","total","neto","bruto","utilidad","margen")) and money_col:
-        return {"sheet": sheet, "value_col": money_col, "category_col": cliente_col or estado_col or "",
-                "op":"sum", "filters":[], "group_by":"none"}
-
-    # Conteos
-    if any(w in qn for w in ("cuantos","cuántos","cuenta","conteo","cantidad","número de","numero de","count")):
-        base = id_col or patente_col or cliente_col
-        if base:
-            return {"sheet": sheet, "value_col": base, "category_col": patente_col or cliente_col or estado_col or "",
-                    "op":"count", "filters":[], "group_by":"none"}
-
-    return {}
 # ======== Compute & Execute ========
 def _apply_filters(df: pd.DataFrame, filters: List[Dict[str,str]]) -> pd.DataFrame:
     if not filters: return df
@@ -2074,12 +2069,13 @@ elif ss.menu_sel == "Consulta IA":
 
         # ------- Responder (junto a la pregunta) -------
         if responder_click and pregunta:
+            # Caso especial determinístico: entregados sin facturar
+            if _special_unbilled_delivered(pregunta, data_filt, schema, left, right):
+                ss.historial.append({'pregunta': pregunta, 'respuesta': 'Listado entregados sin facturar'})
+                st.stop()
+
             data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
             schema = _build_schema(data_filt)
-            # Caso especial determinístico previo a planner
-            if _special_unbilled_delivered(pregunta, data_filt, schema, left, right):
-                ss.historial.append({"pregunta":pregunta, "respuesta":"Listado entregados sin facturar"})
-                st.stop()
             plan_c = plan_from_rules(pregunta, schema) or {}
             if not plan_c.get('value_col'):
                 plan_c = plan_compute_from_llm(pregunta, schema)
@@ -2198,85 +2194,4 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
-
-
-
-# ======== Caso especial determinístico: entregados sin facturar (anti-join MODELO_BOT vs FINANZAS) ========
-def _special_unbilled_delivered(pregunta:str, data:Dict[str,pd.DataFrame], schema:Dict[str,Any], left, right) -> bool:
-    q = re.sub(r"\s+"," ",str(pregunta or "")).lower()
-    if not any(kw in q for kw in ("sin facturar","no facturad","no han sido factura","pendiente de facturar","por facturar")):
-        return False
-    if "MODELO_BOT" not in data or "FINANZAS" not in data: 
-        return False
-    dfm = data.get("MODELO_BOT", pd.DataFrame()).copy()
-    dff = data.get("FINANZAS", pd.DataFrame()).copy()
-    if dfm.empty: 
-        return False
-
-    roles_m = (schema.get("MODELO_BOT") or {}).get("roles", {})
-    roles_f = (schema.get("FINANZAS") or {}).get("roles", {})
-
-    # pick join key in MODELO_BOT: OT preferred then PATENTE
-    key_m = None
-    for k,r in roles_m.items():
-        if r=="id" and "ot" in k.lower(): key_m = k; break
-    if not key_m:
-        for k,r in roles_m.items():
-            if r=="id" and ("patente" in k.lower() or "placa" in k.lower() or "matricula" in k.lower()): key_m = k; break
-    if not key_m: 
-        return False
-
-    # find matching key in FINANZAS
-    key_f = None
-    for k,r in roles_f.items():
-        if r=="id" and k.strip().lower()==key_m.strip().lower(): key_f = k; break
-    if not key_f:
-        for k,r in roles_f.items():
-            if r=="id" and (("patente" in k.lower() and "patente" in key_m.lower()) or ("ot" in k.lower() and "ot" in key_m.lower())):
-                key_f = k; break
-
-    # entrega date column in MODELO_BOT
-    date_entrega = None
-    for k,r in roles_m.items():
-        if r=="date" and any(w in k.lower() for w in ("entrega","egreso","salida")):
-            date_entrega = k; break
-    if not date_entrega:
-        for k,r in roles_m.items():
-            if r=="date":
-                date_entrega = k; break
-    if not date_entrega:
-        return False
-
-    # delivered rows: date not null
-    _dtv = pd.to_datetime(dfm[date_entrega], errors="coerce")
-    df_deliv = dfm[_dtv.notna()].copy()
-    if df_deliv.empty: 
-        return False
-
-    # anti-join: remove those present in FINANZAS by key
-    df_out = df_deliv.copy()
-    if key_f and key_f in dff.columns:
-        keys_fin = set(dff[key_f].dropna().astype(str).str.strip().unique().tolist())
-        df_out = df_out[~df_out[key_m].astype(str).str.strip().isin(keys_fin)]
-
-    # pick columns to show
-    cols = []
-    for name in (key_m, date_entrega):
-        if name in df_out.columns: cols.append(name)
-    for candidate in ("patente","cliente","modelo","estado","proceso"):
-        c = find_col(df_out, candidate)
-        if c and c not in cols: cols.append(c)
-    if not cols:
-        cols = list(df_out.columns)[:10]
-    df_show = df_out[cols].copy()
-
-    with left:
-        st.markdown("### Vehículos entregados **sin facturar**")
-        st.write(f"Total: **{len(df_show)}**")
-        st.caption("Cálculo determinístico: entregados (fecha entrega no vacía) menos claves presentes en FINANZAS.")
-    with right:
-        st.dataframe(df_show, use_container_width=True)
-        st.download_button("⬇️ Descargar listado (CSV)", df_show.to_csv(index=False).encode("utf-8"),
-                           "entregados_no_facturados.csv","text/csv", key=str(int(time.time()*1000)))
-    return True
 
