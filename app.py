@@ -1533,6 +1533,107 @@ PREGUNTA:
     try: return json.loads(m.group(0))
     except Exception: return {}
 
+
+# ======== Planner (rules) ========
+def plan_from_rules(pregunta: str, schema: dict) -> dict:
+    """Planificador basado en reglas para casos frecuentes (por ejemplo: 'entregados sin facturar').
+    Devuelve {} cuando no reconoce el patrón, para que el planner LLM actúe.
+    """
+    import re, unicodedata
+    def _norm(s: str) -> str:
+        s = str(s or '').replace("\u00A0"," ").strip()
+        s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+        s = re.sub(r'\s+',' ', s)
+        return s.lower()
+
+    qn = _norm(pregunta or "")
+
+    if not schema:
+        return {}
+
+    # Elegimos hoja por defecto
+    def _pick_sheet():
+        for h in schema.keys():
+            if _norm(h) in ("modelo_bot","modelo bot"):
+                return h
+        for h in schema.keys():
+            if "finanz" not in _norm(h):
+                return h
+        return list(schema.keys())[0]
+
+    sheet = _pick_sheet()
+    roles = schema.get(sheet, {}).get("roles", {})
+
+    def _find_col_by_keywords(keywords, prefer_roles=()):
+        prefer_roles = set(prefer_roles or [])
+        cand = []
+        for c, r in roles.items():
+            cn = _norm(c)
+            if any(k in cn for k in keywords):
+                cand.append((c, r))
+        if prefer_roles and cand:
+            pr = [c for c, r in cand if r in prefer_roles]
+            if pr:
+                return pr[0]
+        return cand[0][0] if cand else None
+
+    def _first_role(role_name, alt_keywords=None):
+        for c, r in roles.items():
+            if r == role_name:
+                return c
+        if alt_keywords:
+            return _find_col_by_keywords(alt_keywords, prefer_roles=[role_name])
+        return None
+
+    id_col      = _first_role("id") or _find_col_by_keywords(["ot","orden","folio","documento","nro","numero","num"])
+    money_col   = _first_role("money", ["monto","valor","total","neto","bruto","pago","precio"])
+    date_col    = _first_role("date",  ["fecha","emision","ingreso","salida","entrega","factura"])
+    patente_col = _find_col_by_keywords(["patente","placa","matricula","chasis","vin"])
+    cliente_col = _find_col_by_keywords(["cliente","razon social","razón social","nombre cliente"], prefer_roles=["category","text"])
+    estado_col  = _find_col_by_keywords(["estado","etapa","workflow","fase","situacion","situación","proceso","servicio"])
+    factura_col = _find_col_by_keywords(["factura","boleta","nº factura","numero de factura","número de factura","nro factura","doc tributario","facturacion","facturación"])
+
+    # Regla clave: entregados sin facturar
+    if any(w in qn for w in ["no han sido factur","no facturad","pendiente de factur","por facturar","sin facturar"]):
+        filters = []
+        if factura_col:
+            filters.append({"col": factura_col, "op":"isnull", "val": ""})
+        if any(k in qn for k in ["entregad","salid","egres"]):
+            if estado_col:
+                filters.append({"col": estado_col, "op":"contains", "val":"entrega"})
+        value_col = id_col or patente_col or cliente_col or money_col or ""
+        return {
+            "sheet": sheet,
+            "value_col": value_col,
+            "category_col": patente_col or cliente_col or "",
+            "op": "count" if (roles.get(value_col) in ("id","text","category") or value_col==id_col) else "sum",
+            "filters": filters,
+            "group_by": "none",
+        }
+
+    # Montos por categoría genérica
+    if any(w in qn for w in ["monto","ingreso","venta","total","neto","bruto","utilidad","margen"]) and money_col:
+        return {
+            "sheet": sheet,
+            "value_col": money_col,
+            "category_col": cliente_col or estado_col or "",
+            "op": "sum",
+            "filters": [],
+            "group_by": "none",
+        }
+
+    # Conteo genérico
+    if any(w in qn for w in ["cuantos","cuántos","conteo","cantidad","número de","numero de","count"]) and (id_col or patente_col or cliente_col):
+        return {
+            "sheet": sheet,
+            "value_col": id_col or patente_col or cliente_col,
+            "category_col": patente_col or cliente_col or estado_col or "",
+            "op": "count",
+            "filters": [],
+            "group_by": "none",
+        }
+
+    return {}
 # ======== Compute & Execute ========
 def _apply_filters(df: pd.DataFrame, filters: List[Dict[str,str]]) -> pd.DataFrame:
     if not filters: return df
@@ -2113,3 +2214,41 @@ elif ss.menu_sel == "Diagnóstico IA":
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
 
+
+
+# ======== Override: _apply_filters extendido (neq, in, isnull, notnull) ========
+def _apply_filters(df: pd.DataFrame, filters: list[dict]) -> pd.DataFrame:
+    if not filters:
+        return df
+    out = df.copy()
+    for f in (filters or []):
+        col = find_col(out, (f.get("col") or ""))
+        if not col:
+            continue
+        op = (f.get("op") or "eq").lower()
+        val = f.get("val", "")
+        sval = str(val)
+        if op == "eq":
+            out = out[out[col].astype(str).str.lower() == sval.lower()]
+        elif op == "neq":
+            out = out[out[col].astype(str).str.lower() != sval.lower()]
+        elif op == "contains":
+            out = out[out[col].astype(str).str.contains(sval, case=False, na=False)]
+        elif op == "in":
+            import re as _re
+            items = [x.strip().lower() for x in _re.split(r"[|,]", sval) if x.strip()]
+            out = out[out[col].astype(str).str.lower().isin(items)]
+        elif op == "gte":
+            out = out[pd.to_numeric(out[col], errors="coerce") >= pd.to_numeric(val, errors="coerce")]
+        elif op == "lte":
+            out = out[pd.to_numeric(out[col], errors="coerce") <= pd.to_numeric(val, errors="coerce")]
+        elif op == "isnull":
+            s = out[col]
+            out = out[s.isna() | (s.astype(str).str.strip() == "") | (s.astype(str).str.lower().isin(["nan","none","null","0"]))]
+        elif op == "notnull":
+            s = out[col]
+            out = out[~(s.isna() | (s.astype(str).str.strip() == "") | (s.astype(str).str.lower().isin(["nan","none","null","0"])))]
+        else:
+            # op desconocido -> ignora
+            pass
+    return out
