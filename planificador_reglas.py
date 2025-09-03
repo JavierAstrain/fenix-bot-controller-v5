@@ -1,6 +1,9 @@
-
 import re, json, datetime as dt
 from typing import Dict, Any, List
+
+# ===============================
+# Planificador por reglas (determinístico)
+# ===============================
 
 MESES = {
     "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,
@@ -24,9 +27,8 @@ def _pick_date_col(schema, hoja)->str:
 
 def _pick_money_col(schema, hoja)->str:
     roles = _roles(schema, hoja)
-    # prioridad por nombres comunes
-    pref = ["MONTO NETO","Monto Neto","Neto","TOTAL","Total","Importe","Valor","UTILIDAD","Utilidad","Ingresos","Costos"]
-    for p in pref:
+    prefer = ["MONTO NETO","Monto Neto","Neto","TOTAL","Total","Importe","Valor","UTILIDAD","Utilidad","Ingresos","Costos"]
+    for p in prefer:
         for c,r in roles.items():
             if r=="money" and _norm(c)==_norm(p): return c
     for c,r in roles.items():
@@ -35,8 +37,8 @@ def _pick_money_col(schema, hoja)->str:
 
 def _pick_id_col(schema, hoja)->str:
     roles = _roles(schema, hoja)
-    pref = ["OT","N° OT","Numero De Factura","Número De Factura","NUMERO DE FACTURA","PATENTE"]
-    for p in pref:
+    prefer = ["OT","N° OT","NUMERO DE FACTURA","Número De Factura","PATENTE"]
+    for p in prefer:
         for c,r in roles.items():
             if r=="id" and _norm(c)==_norm(p): return c
     for c,r in roles.items():
@@ -45,17 +47,16 @@ def _pick_id_col(schema, hoja)->str:
 
 def _sheet_from_question(q:str)->str:
     qn = _norm(q)
-    # si pregunta de dinero/costos/ingresos → FINANZAS
     if any(w in qn for w in ["monto","ingreso","ingresos","costo","costos","utilidad","margen","factura","facturación","pago","pagos"]):
         return "FINANZAS"
     return "MODELO_BOT"
 
 def _op_from_question(q:str, value_role:str)->str:
     qn = _norm(q)
-    if any(w in qn for w in ["promedio","media","promedi", "avg"]): return "avg"
+    if any(w in qn for w in ["promedio","media","promedi","avg"]): return "avg"
     if any(w in qn for w in ["máximo","maximo","mayor","peak","tope"]): return "max"
     if any(w in qn for w in ["mínimo","minimo","menor"]): return "min"
-    if any(w in qn for w in ["cuántas","cuantos","cuánto número","número de","cantidad de","count","cuenta"]) or value_role=="id":
+    if any(w in qn for w in ["cuántas","cuantos","número de","cantidad de","count","cuenta"]) or value_role=="id":
         return "count"
     return "sum" if value_role!="percent" else "avg"
 
@@ -67,23 +68,17 @@ def _group_by_from_question(q:str)->str:
 
 def _category_from_question(q:str, schema:Dict[str,Any], hoja:str)->str:
     qn = _norm(q)
-    # por <algo>
     m = re.search(r"\bpor\s+([a-záéíóúñ\s]+)$", qn)
     if m:
         target = m.group(1).strip()
-        # buscar coincidencia por nombre aproximado
         cols = _cols(schema, hoja)
         tgt = _norm(target)
-        best = ""
         for c in cols:
             if tgt in _norm(c):
-                best = c; break
-        if best: return best
-    # heurística: si menciona palabras
+                return c
     hints = ["tipo cliente","cliente","marca","modelo","proceso","estado servicio","estado presupuesto","patente","ot"]
     for h in hints:
         if h in qn:
-            # pick first column matching any token of h
             tokens = [t for t in h.split() if t]
             cols = _cols(schema, hoja)
             for c in cols:
@@ -97,35 +92,27 @@ def _date_filters(q:str, schema:Dict[str,Any], hoja:str)->List[Dict[str,str]]:
     col = _pick_date_col(schema, hoja)
     if not col: return []
     out = []
-    # año específico
+    # Año explícito
     m = re.search(r"\b(20\d{2})\b", qn)
     if m:
         y = int(m.group(1))
         out.append({"col":col,"op":"gte","val":f"{y}-01-01"})
         out.append({"col":col,"op":"lte","val":f"{y}-12-31"})
-    # mes (con o sin año)
+    # Mes explícito (con o sin año)
     for mes, num in MESES.items():
         if mes in qn:
-            # año explícito cercano al mes
             ym = re.search(rf"{mes}\s+de?\s*(20\d{{2}})?", qn)
-            y = None
-            if ym and ym.group(1): y = int(ym.group(1))
-            if y is None:
-                y = dt.date.today().year
+            y = int(ym.group(1)) if (ym and ym.group(1)) else dt.date.today().year
             d1 = dt.date(y, num, 1)
-            if num==12:
-                d2 = dt.date(y, 12, 31)
-            else:
-                d2 = dt.date(y, num+1, 1) - dt.timedelta(days=1)
+            d2 = dt.date(y, 12, 31) if num==12 else (dt.date(y, num+1, 1) - dt.timedelta(days=1))
             out.append({"col":col,"op":"gte","val":str(d1)})
             out.append({"col":col,"op":"lte","val":str(d2)})
             break
-    # últimos N meses
+    # Últimos N meses
     m2 = re.search(r"últim[oa]s?\s+(\d{1,2})\s+mes", qn)
     if m2:
         n = int(m2.group(1))
         today = dt.date.today()
-        # approx n months back
         month_back = today.month - n
         year = today.year
         while month_back <= 0:
@@ -137,19 +124,18 @@ def _date_filters(q:str, schema:Dict[str,Any], hoja:str)->List[Dict[str,str]]:
 def plan_from_rules(pregunta:str, schema:Dict[str,Any]) -> Dict[str,Any]:
     hoja = _sheet_from_question(pregunta)
     roles = _roles(schema, hoja)
-    # elegir valor
+    # elegir columna de valor
     value_col = _pick_money_col(schema, hoja) if hoja=="FINANZAS" else _pick_id_col(schema, hoja)
-    value_role = roles.get(value_col,"money" if hoja=="FINANZAS" else "id")
-    # si la pregunta sugiere conteo de id (facturas, ot), usa id en FINANZAS también si existe
+    value_role = roles.get(value_col, "money" if hoja=="FINANZAS" else "id")
+    # si pregunta por facturas/OT, favorecer id incluso en FINANZAS
     if any(w in _norm(pregunta) for w in ["factura","facturas","ot","órdenes","ordenes","orden de trabajo"]):
         cand = _pick_id_col(schema, hoja)
         if cand: value_col, value_role = cand, "id"
     op = _op_from_question(pregunta, value_role)
     category_col = _category_from_question(pregunta, schema, hoja)
     group_by = _group_by_from_question(pregunta)
-    # fecha
     filters = _date_filters(pregunta, schema, hoja)
-    plan = {
+    return {
         "sheet": hoja,
         "value_col": value_col or "",
         "category_col": category_col or "",
@@ -157,4 +143,3 @@ def plan_from_rules(pregunta:str, schema:Dict[str,Any]) -> Dict[str,Any]:
         "filters": filters,
         "group_by": group_by
     }
-    return plan
