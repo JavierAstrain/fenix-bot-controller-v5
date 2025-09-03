@@ -2025,41 +2025,41 @@ elif ss.menu_sel == "Consulta IA":
                         st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
                     
-df_res = normalize_df_result(facts.get("df_result"), facts)
-if facts.get("category_col"):
-    try:
-        df_show = df_res.copy()
-        # Presentación
-        if "CATEGORIA" in df_show.columns: df_show.rename(columns={"CATEGORIA":"Categoría"}, inplace=True)
-        if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
-        # Gráfico si es monetario y no count; si no, tabla
-        if facts.get("value_role")=="money" and facts.get("op","sum")!="count":
-            col_cat = "Categoría" if "Categoría" in df_show.columns else ("CATEGORIA" if "CATEGORIA" in df_res.columns else facts.get("category_col"))
-            col_val = "Valor" if "Valor" in df_show.columns else ("VALOR" if "VALOR" in df_res.columns else _first_numeric_col(df_res, exclude=[col_cat]))
-            if col_cat and col_val:
-                mostrar_grafico_barras_v3(df_res.rename(columns={col_cat:"CATEGORIA", col_val:"VALOR"}) if col_cat in df_res.columns else df_res,
-                                          "CATEGORIA","VALOR",
-                                          f"{facts['op'].upper()} de {facts['value_col']} por {facts['category_col']}")
-        # Tabla formateada
-        if "Valor" in df_show.columns:
-            if facts.get("op","sum")=="count" or facts.get("value_role")!="money":
-                df_show["Valor"] = pd.to_numeric(df_show["Valor"], errors="coerce").fillna(0).astype(int)
-            else:
-                df_show["Valor"] = df_show["Valor"].apply(fmt_money)
-        st.markdown("### 📋 Resultado")
-        st.dataframe(df_show, use_container_width=True)
-        st.download_button("⬇️ Descargar tabla (CSV)",
-                           df_show.to_csv(index=False).encode("utf-8"),
-                           "resultado.csv","text/csv", key=_unique_key("csv"))
-    except Exception as e:
-        st.error(f"Error graficando: {e}")
-        st.dataframe(df_res, use_container_width=True)
-else:
-    # Sin categoría: muestro total limpio
-    df_show = df_res.copy()
-    if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
-    st.metric(f"{facts.get('op','SUM').upper()} de {facts['value_col']}", fmt_money(df_show['Valor'].iloc[0]) if facts.get("value_role")=='money' and facts.get("op","sum")!="count" else _fmt_number_general(df_show['Valor'].iloc[0]))
-    st.dataframe(df_show, use_container_width=True)
+                    df_res = normalize_df_result(facts.get("df_result"), facts)
+                    if facts.get("category_col"):
+                        try:
+                            df_show = df_res.copy()
+                            # Presentación
+                            if "CATEGORIA" in df_show.columns: df_show.rename(columns={"CATEGORIA":"Categoría"}, inplace=True)
+                            if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
+                            # Gráfico si es monetario y no count; si no, tabla
+                            if facts.get("value_role")=="money" and facts.get("op","sum")!="count":
+                                col_cat = "Categoría" if "Categoría" in df_show.columns else ("CATEGORIA" if "CATEGORIA" in df_res.columns else facts.get("category_col"))
+                                col_val = "Valor" if "Valor" in df_show.columns else ("VALOR" if "VALOR" in df_res.columns else _first_numeric_col(df_res, exclude=[col_cat]))
+                                if col_cat and col_val:
+                                    mostrar_grafico_barras_v3(df_res.rename(columns={col_cat:"CATEGORIA", col_val:"VALOR"}) if col_cat in df_res.columns else df_res,
+                                                              "CATEGORIA","VALOR",
+                                                              f"{facts['op'].upper()} de {facts['value_col']} por {facts['category_col']}")
+                            # Tabla formateada
+                            if "Valor" in df_show.columns:
+                                if facts.get("op","sum")=="count" or facts.get("value_role")!="money":
+                                    df_show["Valor"] = pd.to_numeric(df_show["Valor"], errors="coerce").fillna(0).astype(int)
+                                else:
+                                    df_show["Valor"] = df_show["Valor"].apply(fmt_money)
+                            st.markdown("### 📋 Resultado")
+                            st.dataframe(df_show, use_container_width=True)
+                            st.download_button("⬇️ Descargar tabla (CSV)",
+                                               df_show.to_csv(index=False).encode("utf-8"),
+                                               "resultado.csv","text/csv", key=_unique_key("csv"))
+                        except Exception as e:
+                            st.error(f"Error graficando: {e}")
+                            st.dataframe(df_res, use_container_width=True)
+                    else:
+                        # Sin categoría: muestro total limpio
+                        df_show = df_res.copy()
+                        if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
+                        st.metric(f"{facts.get('op','SUM').upper()} de {facts['value_col']}", fmt_money(df_show['Valor'].iloc[0]) if facts.get("value_role")=='money' and facts.get("op","sum")!="count" else _fmt_number_general(df_show['Valor'].iloc[0]))
+                        st.dataframe(df_show, use_container_width=True)
 ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
 
 elif ss.menu_sel == "Historial":
