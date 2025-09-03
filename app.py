@@ -1,191 +1,3 @@
-
-# ---------- Safe dataframe sanitizer for Streamlit ----------
-
-def _safe_df_for_streamlit(df):
-    import pandas as pd
-    out = df.copy()
-
-    # 0) Column names to string
-    try:
-        out.columns = list(map(lambda x: str(x), out.columns))
-    except Exception:
-        pass
-
-    # 1) Flatten MultiIndex
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = [' / '.join(map(str, tup)) for tup in out.columns.to_list()]
-
-    # 2) Deduplicate column names
-    try:
-        from pandas.io.parsers import ParserBase
-        out.columns = ParserBase({'names': out.columns})._maybe_dedup_names(out.columns)
-    except Exception:
-        pass
-
-    # 3) Normalize columns to Arrow-friendly
-    for col in list(out.columns):
-        s = out[col]
-        if isinstance(s, pd.DataFrame):
-            try:
-                out[col] = s.astype(str).agg(' | '.join, axis=1)
-            except Exception:
-                out[col] = s.astype(str).fillna("")
-            continue
-
-        try:
-            s_dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
-            if s_dt.notna().sum() > 0 and (str(s.dtype) == "object" or "datetime" in str(s_dt.dtype)):
-                try:
-                    s_dt = s_dt.dt.tz_localize(None)
-                except Exception:
-                    pass
-                out[col] = s_dt
-                continue
-        except Exception:
-            pass
-
-        try:
-            if str(getattr(s, "dtype", "")) == "category":
-                out[col] = s.astype(str)
-                continue
-        except Exception:
-            pass
-
-        if str(getattr(s, "dtype", "object")) == "object":
-            def _to_safe(v):
-                if isinstance(v, (int, float, str, bool, type(None))):
-                    return v
-                try:
-                    import numpy as _np
-                    if isinstance(v, (_np.integer, _np.floating, _np.bool_)):
-                        return v.item()
-                except Exception:
-                    pass
-                return str(v)
-            out[col] = s.map(_to_safe)
-
-    # 4) Final validation with PyArrow; fallback full string if needed
-    try:
-        import pyarrow as pa
-        _ = pa.Table.from_pandas(out, preserve_index=False)
-    except Exception:
-        out = out.applymap(lambda v: v if isinstance(v, (int,float,str,bool,type(None))) else str(v))
-        try:
-            import pyarrow as pa
-            _ = pa.Table.from_pandas(out, preserve_index=False)
-        except Exception:
-            out = out.astype(str)
-
-    return out
-
-
-# ========= Smart listing helpers (vehículos/OTs) =========
-def _find_cols(df, keywords):
-    kw = {_normtxt(k) for k in keywords}
-    found = []
-    for c in df.columns:
-        n = _normtxt(c)
-        if any(k in n for k in kw):
-            found.append(c)
-    return found
-
-def _pick_vehicle_cols(df):
-    prefs = [
-        ["PATENTE","PLACA","MATRICULA","MATRÍCULA"],
-        ["MARCA"], ["MODELO"],
-        ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],
-        ["COLOR"], ["AÑO","ANIO"],
-        ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
-        ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],
-        ["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]
-    ]
-    cols = []
-    for group in prefs:
-        got = _find_cols(df, group)
-        if got: cols.append(got[0])
-    if not cols: cols = list(df.columns[:6])
-    return cols[:10]
-
-_DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
-
-def _mask_delivered(df):
-    for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA","SALIDA","EGRESO","TERMINO","TÉRMINO"]):
-        try:
-            return df[c].notna() & (df[c].astype(str).str.strip()!="")
-        except Exception:
-            pass
-    for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA","SITUACION","SITUACIÓN"]):
-        s = df[c].astype(str).map(_normtxt)
-        return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
-    return pd.Series([True]*len(df))
-
-
-def _mask_not_invoiced(df):
-    """
-    Devuelve máscara de "NO FACTURADO". Si no se detecta ninguna columna de factura, retorna todo Falso
-    para evitar falsos positivos.
-    """
-    cand = _find_cols(df, [
-        "FACTURA","FACTURACION","FACTURACIÓN","N° FACT","NRO FACT","NUMERO FACT","NUMERO FACTURA",
-        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT",
-        "FOLIO","N° DOCUMENTO","NRO DOCUMENTO","NUMERO DOCUMENTO","BOLETA"
-    ])
-    for c in df.columns:
-        if 'fact' in _normtxt(c) and c not in cand:
-            cand.append(c)
-    if not cand:
-        return pd.Series([False]*len(df))
-
-    m = pd.Series([False]*len(df))
-    for c in cand:
-        s = df[c]
-        s_norm = s.astype(str).map(_normtxt)
-        m = m | s_norm.isin({'','nan','none','0','no','false','pendiente','sin','s/factura'}) | s_norm.str.contains('pendient|sin fact|no fact', na=False)
-        try:
-            snum = pd.to_numeric(s, errors='coerce')
-            m = m | snum.isna() | (snum==0)
-        except Exception:
-            pass
-        if str(s.dtype) == 'bool':
-            m = m | (~s)
-    return m
-
-
-def _smart_list_vehicles(question: str, data: dict):
-    q = _normtxt(question)
-    wants_list = any(w in q for w in ['cuales son','cuáles son','cual es','cuál es','lista','listado','muestrame','muéstrame','mostrar','detalla','detallar','que vehic','qué vehic','que autos','qué autos','vehiculos','vehículos','patentes'])
-    needs_delivered = 'entreg' in q
-    needs_not_invoiced = ('no han sido factur' in q) or ((' no ' in f' {q} ') and ('factur' in q)) or ('pendient' in q)
-    if not wants_list:
-        return None
-    df = data.get('MODELO_BOT')
-    if df is None or df.empty:
-        return None
-    mask = pd.Series([True]*len(df))
-    if needs_delivered: mask = mask & _mask_delivered(df)
-    if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
-    res = df.loc[mask].copy()
-    if res.empty:
-        return {'text':'No encontré vehículos con ese criterio.', 'df': pd.DataFrame()}
-    cols = _pick_vehicle_cols(res)
-    res = res[[c for c in cols if c in res.columns]].drop_duplicates().head(300)
-    pat = next((c for c in res.columns if _normtxt(c) in {'patente','placa','matricula','matrícula'}), None)
-    mar = next((c for c in res.columns if _normtxt(c)=='marca'), None)
-    mod = next((c for c in res.columns if _normtxt(c)=='modelo'), None)
-    fe  = next((c for c in res.columns if 'entrega' in _normtxt(c)), None)
-    preview = []
-    for _, r in res.head(5).iterrows():
-        s = []
-        if pat and r.get(pat): s.append(str(r.get(pat)))
-        if mar and r.get(mar): s.append(str(r.get(mar)))
-        if mod and r.get(mod): s.append(str(r.get(mod)))
-        if fe and r.get(fe):  s.append(f'entrega: {r.get(fe)}')
-        if s: preview.append(' · '.join(s))
-    header = '### Vehículos encontrados\n'
-    bullets = '\n'.join([f'- {x}' for x in preview]) if preview else '- (sin vista previa)'
-    text = header + bullets + f'\n\nTotal vehículos: {len(res)}'
-    return {'text': text, 'df': res}
-
 # app.py
 # Controller Financiero IA — build: 2025-08-27 focus-v7b
 
@@ -243,37 +55,63 @@ def _mask_delivered(df):
     return pd.Series([True]*len(df))
 
 
-
 def _mask_not_invoiced(df):
     """
-    Devuelve máscara de "NO FACTURADO". Si no se detecta ninguna columna de factura, retorna todo Falso
-    para evitar falsos positivos.
+    Detecta filas NO FACTURADAS con varias heurísticas robustas:
+    - Busca columnas cuyo nombre contenga 'FACT', 'FACTU', 'N° FACT', 'FECHA FACT', 'ESTADO FACT', etc.
+    - Si existe una columna booleana/flag tipo 'FACTURADO', considera False/0/'no'/vacío/'pendiente' como NO facturado.
+    - Si hay columnas de número de factura, toma vacío/0/NaN como NO facturado.
+    - Si no encuentra nada, devuelve True (no filtra).
+    - Además, intenta leer columnas señaladas en DICCIONARIO cuyo rol/descripción mencione 'factur'.
     """
-    cand = _find_cols(df, [
+    import pandas as pd
+    # 1) Candidatas por nombre
+    name_hits = _find_cols(df, [
         "FACTURA","FACTURACION","FACTURACIÓN","N° FACT","NRO FACT","NUMERO FACT","NUMERO FACTURA",
-        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT",
-        "FOLIO","N° DOCUMENTO","NRO DOCUMENTO","NUMERO DOCUMENTO","BOLETA"
+        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT"
     ])
+    # 2) Por patrón general 'fact' en cualquier columna
     for c in df.columns:
-        if 'fact' in _normtxt(c) and c not in cand:
-            cand.append(c)
-    if not cand:
-        return pd.Series([False]*len(df))
+        if "fact" in _normtxt(c):
+            if c not in name_hits:
+                name_hits.append(c)
 
+    # 3) Candidatas desde DICCIONARIO (si existe en sesión)
+    try:
+        role_idx = st.session_state.get("role_index") or {}
+        meta_cols = set()
+        for sheet_meta in role_idx.values():
+            for col, meta in (sheet_meta or {}).items():
+                txt = _normtxt(str(meta.get("rol","")) + " " + str(meta.get("descripcion","")))
+                if "fact" in txt and col in df.columns:
+                    meta_cols.add(col)
+        for c in meta_cols:
+            if c not in name_hits:
+                name_hits.append(c)
+    except Exception:
+        pass
+
+    if not name_hits:
+        return pd.Series([True]*len(df))
+
+    # 4) Construye máscara de NO facturado
     m = pd.Series([False]*len(df))
-    for c in cand:
+    for c in name_hits:
         s = df[c]
+        # Normaliza a string para evaluar vacíos/pendientes
         s_norm = s.astype(str).map(_normtxt)
-        m = m | s_norm.isin({'','nan','none','0','no','false','pendiente','sin','s/factura'}) | s_norm.str.contains('pendient|sin fact|no fact', na=False)
+        # Criterios de "no facturado"
+        m = m | s_norm.isin({"","nan","none","0","no","false"})                 | s_norm.str.contains("pendient|sin|no fact", na=False)
+        # Si es numérico y >0 => facturado; 0 o NaN => no facturado
         try:
-            snum = pd.to_numeric(s, errors='coerce')
+            snum = pd.to_numeric(s, errors="coerce")
             m = m | snum.isna() | (snum==0)
         except Exception:
             pass
-        if str(s.dtype) == 'bool':
+        # Si parece booleano/flag
+        if str(s.dtype) == "bool":
             m = m | (~s)
     return m
-
 
 def _smart_list_vehicles(question: str, data: dict):
     q = _normtxt(question)
@@ -1127,7 +965,7 @@ def mostrar_tabla(df, col_categoria, col_valor, titulo=None):
     total_val = vals.sum(skipna=True)
     resumen.loc[len(resumen)] = ["TOTAL", fmt_money(total_val)]
     st.markdown(f"### 📊 {titulo if titulo else f'{col_val} por {col_categoria}'}")
-    st.dataframe(_safe_df_for_streamlit(resumen), use_container_width=True)
+    st.dataframe(resumen, use_container_width=True)
     st.download_button("⬇️ Descargar tabla (CSV)",
                        resumen.to_csv(index=False).encode("utf-8"),
                        "tabla.csv", "text/csv",
@@ -1142,7 +980,7 @@ def mostrar_tabla_count(g: pd.DataFrame, cat_col: str, count_col: str, titulo: s
     df_total = pd.DataFrame([{"Categoría":"TOTAL","OCs/OTs": total}])
     tabla = pd.concat([df, df_total], ignore_index=True)
     st.markdown(f"### 📋 {titulo}")
-    st.dataframe(_safe_df_for_streamlit(tabla), use_container_width=True)
+    st.dataframe(tabla, use_container_width=True)
     st.download_button("⬇️ Descargar tabla (CSV)",
                        tabla.to_csv(index=False).encode("utf-8"),
                        "tabla.csv", "text/csv",
@@ -1304,7 +1142,7 @@ def render_finance_table(data: Dict[str, pd.DataFrame]) -> None:
     margen = ingresos - costos
     df_tab = pd.DataFrame({"Concepto":["Ingresos","Costos","Margen"], "Monto":[ingresos,costos,margen]})
     df_tab["Monto"] = df_tab["Monto"].apply(fmt_money)
-    st.dataframe(_safe_df_for_streamlit(df_tab), use_container_width=True)
+    st.dataframe(df_tab, use_container_width=True)
 
 # ======== Pair finders ========
 def find_best_pair_money(data: Dict[str, pd.DataFrame], category_match: callable):
@@ -2184,52 +2022,7 @@ elif ss.menu_sel == "Consulta IA":
 
         
 # ------- Responder (junto a la pregunta) -------
-try:
-    responder_click
-except NameError:
-    responder_click=False
-try:
-    pregunta
-except NameError:
-    pregunta=''
 if responder_click and pregunta:
-    _ALLOWED={'MODELO_BOT','FINANZAS','DICCIONARIO'}
-    data_allowed={k:v for k,v in (data or {}).items() if k in _ALLOWED}
-    # Smart intent: entregados no facturados con cruce inter-hojas
-    qn=_normtxt(pregunta)
-    try:
-        from analizador_v2 import build_role_index, entregados_no_facturados, narrativa_resumen, analizar_datos_taller
-        diccionario_df=data_allowed.get('DICCIONARIO') if isinstance(data_allowed.get('DICCIONARIO'), pd.DataFrame) else None
-        dic_idx=build_role_index(diccionario_df) if diccionario_df is not None else {}
-
-# Router de intenciones (controller financiero/operaciones)
-try:
-    result_router = _route_intent(pregunta, data_allowed, dic_idx)
-except Exception as _e_router:
-    result_router = None
-if isinstance(result_router, dict) and result_router.get("text") is not None:
-    with left:
-        render_ia_html_block(prettify_answer(result_router["text"]), height=520)
-    with right:
-        if isinstance(result_router.get("df"), pd.DataFrame) and not result_router["df"].empty:
-            st.markdown("#### Resultado (tabla)")
-            st.dataframe(_safe_df_for_streamlit(result_router["df"]), use_container_width=True, height=460)
-    st.session_state.historial.append({"pregunta": pregunta, "respuesta": result_router.get("text","")})
-    st.stop()
-        if ('entreg' in qn) and (('no han sido factur' in qn) or ('sin factur' in qn) or ('pendient' in qn)):
-            df_nf=entregados_no_facturados(data_allowed, dic_idx, days_back=180)
-            if isinstance(df_nf, pd.DataFrame) and not df_nf.empty:
-                facts=analizar_datos_taller({k:v for k,v in data_allowed.items() if k!='DICCIONARIO'})
-                left_text=narrativa_resumen(facts)+"\n\n**Consulta**: Vehículos entregados sin facturar (últimos 180 días)."
-                with left:
-                    render_ia_html_block(prettify_answer(left_text), height=520)
-                with right:
-                    st.markdown('#### Resultado (tabla)')
-                    st.dataframe(_safe_df_for_streamlit(df_nf), use_container_width=True, height=460)
-                st.session_state.historial.append({'pregunta':pregunta,'respuesta':left_text})
-                st.stop()
-    except Exception: pass
-
     # Prepara datos y esquema (si la pregunta trae fechas, filtramos)
     data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
     schema = _build_schema(data_filt)
@@ -2258,8 +2051,14 @@ if isinstance(result_router, dict) and result_router.get("text") is not None:
                 st.markdown("#### Resultado (tabla)")
                 df_show = smart["df"].copy()
                 # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
-                df_show = _safe_df_for_streamlit(df_show)
-                st.dataframe(_safe_df_for_streamlit(df_show), use_container_width=True, height=460)
+                for c in df_show.columns:
+                    if str(df_show[c].dtype) == "object":
+                        try:
+                            df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
+                        except Exception:
+                            pass
+                        df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
+                st.dataframe(df_show, use_container_width=True, height=460)
 
         st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
         st.stop()
@@ -2305,19 +2104,19 @@ if isinstance(result_router, dict) and result_router.get("text") is not None:
                                 else:
                                     df_show["Valor"] = df_show["Valor"].apply(fmt_money)
                                 st.markdown("### 📋 Resultado")
-                                st.dataframe(_safe_df_for_streamlit(df_show), use_container_width=True)
+                                st.dataframe(df_show, use_container_width=True)
                                 st.download_button("⬇️ Descargar tabla (CSV)",
                                                    df_show.to_csv(index=False).encode("utf-8"),
                                                    "resultado.csv","text/csv", key=_unique_key("csv"))
                         except Exception as e:
                             st.error(f"Error graficando: {e}")
-                            st.dataframe(_safe_df_for_streamlit(df_res), use_container_width=True)
+                            st.dataframe(df_res, use_container_width=True)
                     else:
                         role = facts.get("value_role","unknown")
                         valtxt = (fmt_money(facts['total']) if role=="money" and facts.get("op","sum")!="count"
                                   else _fmt_number_general(facts['total']))
                         st.metric(f"{facts['op'].upper()} de {facts['value_col']}", valtxt)
-                        st.dataframe(_safe_df_for_streamlit(df_res), use_container_width=True)
+                        st.dataframe(df_res, use_container_width=True)
                     st.caption(f"Hoja: {facts['sheet']} • Filas: {facts['rows']}")
                 ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
 
@@ -2339,7 +2138,7 @@ elif ss.menu_sel == "Uso de Tokens":
     if _df_tok.empty:
         st.info("Sin registros todavía. A medida que hagas consultas o análisis se guardará aquí el uso.")
     else:
-        st.dataframe(_safe_df_for_streamlit(_df_tok.sort_values("ts"), ascending=False), use_container_width=True)
+        st.dataframe(_df_tok.sort_values("ts", ascending=False), use_container_width=True)
         st.metric("Consultas registradas", int(len(_df_tok)))
         if "total_tokens" in _df_tok:
             st.metric("Total de tokens", int(pd.to_numeric(_df_tok["total_tokens"], errors="coerce").sum()))
@@ -2369,56 +2168,3 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
-
-
-# -------- Intent Router --------
-def _route_intent(pregunta:str, data_allowed, dic_idx):
-    q = _normtxt(pregunta) if "_normtxt" in globals() else pregunta.lower().strip()
-    facts = analizar_datos_taller({k:v for k,v in data_allowed.items() if k!="DICCIONARIO"})
-
-    # 1) Entregados sin facturar
-    if ("entreg" in q) and (("no han sido factur" in q) or ("sin factur" in q) or ("pendient" in q)):
-        df = entregados_no_facturados(data_allowed, dic_idx, days_back=180)
-        text = narrativa_controller("Vehículos entregados sin facturar", facts, [
-            "Cruce entre MODELO_BOT y FINANZAS/DOC para detectar entregas sin documento.",
-            "Control estricto de facturación dentro de 48h posteriores a entrega."
-        ])
-        return {"text": text, "df": df}
-
-    # 2) Ingresos por aseguradora / cliente
-    if ("ingreso" in q or "venta" in q) and ("asegurador" in q or "compania" in q or "compañ" in q):
-        df = ingresos_por_agrupador(data_allowed, dic_idx, group="aseguradora", months_back=6)
-        text = narrativa_controller("Ingresos por aseguradora (últimos 6 meses)", facts, [
-            "Priorizar cuentas top por margen y recurrencia.",
-            "Revisar política de descuentos y tiempos de pago por aseguradora."
-        ])
-        return {"text": text, "df": df}
-    if ("ingreso" in q or "venta" in q) and ("client" in q):
-        df = ingresos_por_agrupador(data_allowed, dic_idx, group="cliente", months_back=6)
-        text = narrativa_controller("Ingresos por cliente (últimos 6 meses)", facts, [
-            "Identificar clientes con alto ticket y rotación para fidelización.",
-            "Detectar clientes de bajo margen para ajustar condiciones."
-        ])
-        return {"text": text, "df": df}
-
-    # 3) Proyección próximo mes (ingresos/margen)
-    if ("proyecc" in q or "estimac" in q) and ("proximo" in q or "próximo" in q or "mes" in q):
-        info = proyeccion_mes_siguiente(data_allowed, dic_idx)
-        s = info.get("serie", pd.DataFrame())
-        fc = info.get("forecast")
-        text = narrativa_controller("Proyección de ingresos y margen (próximo mes)", facts, [
-            "Proyección por promedio móvil de 3 meses.",
-            "Ajustar dotación y compras al nivel esperado de ventas."
-        ], forecast=fc)
-        return {"text": text, "df": s}
-
-    # 4) Resumen/KPIs
-    if q in {"", "resumen", "kpi", "kpis", "analisis", "análisis", "analisis general", "análisis general"}:
-        s = series_mensual_finanzas(data_allowed, dic_idx)
-        text = narrativa_controller("Resumen general & KPIs", facts, [
-            "Revisar tendencia de margen mensual.",
-            "Controlar rotación de OT y tiempos en planta."
-        ])
-        return {"text": text, "df": s}
-
-    return None
