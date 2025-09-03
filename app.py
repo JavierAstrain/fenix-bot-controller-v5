@@ -951,6 +951,36 @@ def _barras_horizontal_generic(resumen, titulo, as_money=True):
     except Exception as e:
         st.caption(f"Descarga no disponible: {e}")
 
+
+def _first_numeric_col(df, exclude=None):
+    exclude = set(exclude or [])
+    for c in df.columns:
+        if c in exclude: continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().any():
+            return c
+    # fallback: first non-excluded column
+    for c in df.columns:
+        if c not in exclude:
+            return c
+    return None
+
+def normalize_df_result(df: pd.DataFrame, facts: dict) -> pd.DataFrame:
+    """Garantiza columnas 'CATEGORIA' (si aplica) y 'VALOR' en df_result."""
+    if df is None or len(df.columns)==0:
+        return df
+    out = df.copy()
+    cat = facts.get("category_col")
+    # Normalizar columna de categoría
+    if cat and cat in out.columns and "CATEGORIA" not in out.columns:
+        out = out.rename(columns={cat:"CATEGORIA"})
+    # Normalizar columna de valor
+    if "VALOR" not in out.columns:
+        # candidato: el primero numérico que no sea 'CATEGORIA'
+        cand = _first_numeric_col(out, exclude=["CATEGORIA", cat] if cat else ["CATEGORIA"])
+        if cand:
+            out = out.rename(columns={cand:"VALOR"})
+    return out
 def mostrar_grafico_barras_v3(df, col_categoria, col_valor, titulo=None):
     vals = pd.to_numeric(df[col_valor], errors="coerce")
     resumen = (df.assign(__v=vals)
@@ -1553,37 +1583,35 @@ def execute_plan(plan: Dict[str, Any], data: Dict[str, Any]) -> bool:
             st.error(f"Error visualizando en '{h}': {e}"); return False
     return False
 
+
 def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, Any]:
-    if not plan_c: return {"ok": False, "msg": "No hubo plan de cómputo."}
+    if not plan_c: 
+        return {"ok": False, "msg": "No hubo plan de cómputo."}
     sheet = plan_c.get("sheet") or ""
     hojas = [sheet] if (sheet and sheet in data) else list(data.keys())
     group_by = (plan_c.get("group_by") or "none").lower()
-    last_err = None
-    for h in hojas:
-        df = data[h]
-        if df is None or df.empty: continue
-        roles = detect_roles_for_sheet(df, h)
 
+    def _compute_for_sheet(h):
+        df = data[h]
+        if df is None or df.empty: 
+            return {"ok": False, "msg": "Hoja vacía."}
+        roles = detect_roles_for_sheet(df, h)
         vraw = plan_c.get("value_col")
         if not vraw:
             money = [c for c,r in roles.items() if r=="money"]
             vraw = money[0] if money else None
         if not vraw:
-            last_err = "No se encontró columna de valor adecuada."
-            continue
+            return {"ok": False, "msg": "No se encontró columna de valor adecuada."}
         vcol = find_col(df, vraw) or vraw
         if vcol not in df.columns:
-            last_err = f"Columna de valor no existe en '{h}'."
-            continue
+            return {"ok": False, "msg": f"Columna de valor no existe en '{h}'."}
 
         crow = plan_c.get("category_col") or ""
         ccol = find_col(df, crow) if crow else None
         filters = plan_c.get("filters") or []
         op = (plan_c.get("op") or "sum").lower()
-
         vrole = roles.get(vcol, "unknown")
         if vrole == "id" and op != "count": op = "count"
-
         dff = _apply_filters(df, filters) if filters else df
         try:
             if ccol and roles.get(ccol) == "date" and group_by in ("month","year"):
@@ -1617,12 +1645,7 @@ def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
                     srs = dff.assign(__v=srs).groupby(ccol, dropna=False)["__v"].sum()
                 srs = srs.sort_values(ascending=False)
                 total = float(srs.sum()) if op != "count" else int(srs.sum())
-                df_res = srs.reset_index().rename(columns={ccol:"CATEGORIA", 0:"VALOR", "__v":"VALOR"})
-                by_cat = [{"categoria": str(k), "valor": (float(v) if op!="count" else int(v))} for k,v in srs.items()]
-                vrole_out = ("quantity" if op=="count" or vrole in ("id","quantity") else vrole)
-                return {"ok": True, "sheet": h, "value_col": vcol, "category_col": ccol, "op": op,
-                        "rows": int(len(dff)), "total": total, "by_category": by_cat,
-                        "value_role": vrole_out, "df_result": df_res}
+                df_res = srs.reset_index().rename(columns={ccol:"CATEGORIA"})
             else:
                 if op == "count":
                     total = int(dff[vcol].nunique()) if vrole=="id" else int(dff[vcol].count())
@@ -1634,16 +1657,36 @@ def execute_compute(plan_c: Dict[str, Any], data: Dict[str, Any]) -> Dict[str, A
                     total = float(pd.to_numeric(dff[vcol], errors="coerce").min())
                 else:
                     total = float(pd.to_numeric(dff[vcol], errors="coerce").sum())
-                vrole_out = ("quantity" if op=="count" or vrole in ("id","quantity") else vrole)
-                df_res = pd.DataFrame({"CATEGORIA": ["TOTAL"], "VALOR": [total]})
-                return {"ok": True, "sheet": h, "value_col": vcol, "category_col": None, "op": op,
-                        "rows": int(len(dff)), "total": total, "by_category": [],
-                        "value_role": vrole_out, "df_result": df_res}
+                df_res = pd.DataFrame({"CATEGORIA": ["TOTAL"], "__VAL__": [total]})
+            # Ensure 'VALOR' column:
+            if "__v" in df_res.columns:
+                df_res = df_res.rename(columns={"__v":"VALOR"})
+            if "__VAL__" in df_res.columns:
+                df_res = df_res.rename(columns={"__VAL__":"VALOR"})
+            if "VALOR" not in df_res.columns:
+                num = _first_numeric_col(df_res, exclude=["CATEGORIA"])
+                if num: df_res = df_res.rename(columns={num:"VALOR"})
+            vrole_out = ("quantity" if op=="count" or vrole in ("id","quantity") else vrole)
+            return {"ok": True, "sheet": h, "value_col": vcol, "category_col": ccol, "op": op,
+                    "rows": int(len(dff)), "total": float(total) if op!="count" else int(total),
+                    "by_category": [], "value_role": vrole_out, "df_result": df_res}
         except Exception as e:
-            last_err = f"Cálculo falló en '{h}': {e}"
-            continue
-    return {"ok": False, "msg": last_err or "No se pudo calcular."}
+            return {"ok": False, "msg": f"Cálculo falló en '{h}': {e}"}
 
+    last = {"ok": False, "msg": "No se pudo calcular."}
+    for h in hojas:
+        r1 = _compute_for_sheet(h)
+        if r1.get("ok") and (r1.get("rows",0)>0):
+            return r1
+        # Fallback: si quedó en 0 filas por filtros, intenta sin filtros
+        if not r1.get("ok") or r1.get("rows",0)==0:
+            plan_nf = dict(plan_c); plan_nf["filters"] = []
+            r2 = _compute_for_sheet(h)
+            if r2.get("ok") and (r2.get("rows",0)>0):
+                r2["msg"] = "Aplicado fallback: sin filtros por baja cobertura."
+                return r2
+        last = r1
+    return last
 def build_verified_summary(facts: dict) -> str:
     val = facts.get("value_col","valor")
     cat = facts.get("category_col","")
@@ -1981,40 +2024,43 @@ elif ss.menu_sel == "Consulta IA":
                     if _u:
                         st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
-                    df_res = facts["df_result"]
-                    if facts.get("category_col"):
-                        try:
-                            if facts.get("value_role")=="money" and facts.get("op","sum")!="count":
-                                mostrar_grafico_barras_v3(
-                                    df_res.rename(columns={facts["category_col"]: "CATEGORIA",
-                                                           "VALOR": "VALOR"}),
-                                    "CATEGORIA", "VALOR",
-                                    f"{facts['op'].upper()} de {facts['value_col']} por {facts['category_col']}"
-                                )
-                            else:
-                                # para conteos o no-moneda, uso tablas si está muy largo
-                                st.info("Distribución desbalanceada: muestro tabla para mejor lectura." if len(df_res)>15 else "")
-                                df_show = df_res.rename(columns={facts["category_col"]:"Categoría","VALOR":"Valor"}).copy()
-                                if facts.get("op","sum")=="count" or facts.get("value_role")!="money":
-                                    df_show["Valor"] = df_show["Valor"].apply(lambda v: int(round(float(v))) if pd.notna(v) else 0)
-                                else:
-                                    df_show["Valor"] = df_show["Valor"].apply(fmt_money)
-                                st.markdown("### 📋 Resultado")
-                                st.dataframe(df_show, use_container_width=True)
-                                st.download_button("⬇️ Descargar tabla (CSV)",
-                                                   df_show.to_csv(index=False).encode("utf-8"),
-                                                   "resultado.csv","text/csv", key=_unique_key("csv"))
-                        except Exception as e:
-                            st.error(f"Error graficando: {e}")
-                            st.dataframe(df_res, use_container_width=True)
-                    else:
-                        role = facts.get("value_role","unknown")
-                        valtxt = (fmt_money(facts['total']) if role=="money" and facts.get("op","sum")!="count"
-                                  else _fmt_number_general(facts['total']))
-                        st.metric(f"{facts['op'].upper()} de {facts['value_col']}", valtxt)
-                        st.dataframe(df_res, use_container_width=True)
-                    st.caption(f"Hoja: {facts['sheet']} • Filas: {facts['rows']}")
-                ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
+                    
+df_res = normalize_df_result(facts.get("df_result"), facts)
+if facts.get("category_col"):
+    try:
+        df_show = df_res.copy()
+        # Presentación
+        if "CATEGORIA" in df_show.columns: df_show.rename(columns={"CATEGORIA":"Categoría"}, inplace=True)
+        if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
+        # Gráfico si es monetario y no count; si no, tabla
+        if facts.get("value_role")=="money" and facts.get("op","sum")!="count":
+            col_cat = "Categoría" if "Categoría" in df_show.columns else ("CATEGORIA" if "CATEGORIA" in df_res.columns else facts.get("category_col"))
+            col_val = "Valor" if "Valor" in df_show.columns else ("VALOR" if "VALOR" in df_res.columns else _first_numeric_col(df_res, exclude=[col_cat]))
+            if col_cat and col_val:
+                mostrar_grafico_barras_v3(df_res.rename(columns={col_cat:"CATEGORIA", col_val:"VALOR"}) if col_cat in df_res.columns else df_res,
+                                          "CATEGORIA","VALOR",
+                                          f"{facts['op'].upper()} de {facts['value_col']} por {facts['category_col']}")
+        # Tabla formateada
+        if "Valor" in df_show.columns:
+            if facts.get("op","sum")=="count" or facts.get("value_role")!="money":
+                df_show["Valor"] = pd.to_numeric(df_show["Valor"], errors="coerce").fillna(0).astype(int)
+            else:
+                df_show["Valor"] = df_show["Valor"].apply(fmt_money)
+        st.markdown("### 📋 Resultado")
+        st.dataframe(df_show, use_container_width=True)
+        st.download_button("⬇️ Descargar tabla (CSV)",
+                           df_show.to_csv(index=False).encode("utf-8"),
+                           "resultado.csv","text/csv", key=_unique_key("csv"))
+    except Exception as e:
+        st.error(f"Error graficando: {e}")
+        st.dataframe(df_res, use_container_width=True)
+else:
+    # Sin categoría: muestro total limpio
+    df_show = df_res.copy()
+    if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
+    st.metric(f"{facts.get('op','SUM').upper()} de {facts['value_col']}", fmt_money(df_show['Valor'].iloc[0]) if facts.get("value_role")=='money' and facts.get("op","sum")!="count" else _fmt_number_general(df_show['Valor'].iloc[0]))
+    st.dataframe(df_show, use_container_width=True)
+ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
 
 elif ss.menu_sel == "Historial":
     if ss.historial:
