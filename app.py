@@ -2,166 +2,6 @@
 # Controller Financiero IA — build: 2025-08-27 focus-v7b
 
 import streamlit as st
-
-
-# ========================
-# Helpers de intención inteligente (listado de vehículos/OTs)
-# ========================
-import unicodedata
-
-def _normtxt(s:str)->str:
-    if s is None: return ""
-    s = str(s)
-    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-    return s.lower().strip()
-
-def _find_cols(df, keywords):
-    kw = {_normtxt(k) for k in keywords}
-    found = []
-    for c in df.columns:
-        n = _normtxt(c)
-        if any(k in n for k in kw):
-            found.append(c)
-    return found
-
-def _pick_vehicle_cols(df):
-    prefs = [
-        ["PATENTE","PLACA","MATRICULA","MATRÍCULA"],
-        ["MARCA"], ["MODELO"],
-        ["TIPO VEHICULO","TIPO VEHÍCULO","TIPO"],
-        ["COLOR"], ["AÑO","ANIO"],
-        ["# OT","OT","N° OT","NUMERO OT","NUMERO DE OT","NRO OT"],
-        ["FECHA ENTREGA","ENTREGA","F. ENTREGA"],
-        ["CLIENTE","NOMBRE CLIENTE","ASEGURADORA","TIPO CLIENTE"]
-    ]
-    cols = []
-    for group in prefs:
-        got = _find_cols(df, group)
-        if got: cols.append(got[0])
-    if not cols: cols = list(df.columns[:5])
-    return cols[:8]
-
-_DEF_DELIVERED_VALUES = {"entregado","entregada","finalizado","finalizada","completado","terminado","cerrado"}
-
-def _mask_delivered(df):
-    for c in _find_cols(df, ["FECHA ENTREGA","ENTREGA"]):
-        try:
-            return df[c].notna() & (df[c].astype(str).str.strip()!="")
-        except Exception:
-            pass
-    for c in _find_cols(df, ["ESTADO SERVICIO","ESTADO","ETAPA"]):
-        s = df[c].astype(str).map(_normtxt)
-        return s.isin(_DEF_DELIVERED_VALUES) | s.str.contains("entreg", na=False) | s.str.contains("finaliz", na=False)
-    return pd.Series([True]*len(df))
-
-
-def _mask_not_invoiced(df):
-    """
-    Detecta filas NO FACTURADAS con varias heurísticas robustas:
-    - Busca columnas cuyo nombre contenga 'FACT', 'FACTU', 'N° FACT', 'FECHA FACT', 'ESTADO FACT', etc.
-    - Si existe una columna booleana/flag tipo 'FACTURADO', considera False/0/'no'/vacío/'pendiente' como NO facturado.
-    - Si hay columnas de número de factura, toma vacío/0/NaN como NO facturado.
-    - Si no encuentra nada, devuelve True (no filtra).
-    - Además, intenta leer columnas señaladas en DICCIONARIO cuyo rol/descripción mencione 'factur'.
-    """
-    import pandas as pd
-    # 1) Candidatas por nombre
-    name_hits = _find_cols(df, [
-        "FACTURA","FACTURACION","FACTURACIÓN","N° FACT","NRO FACT","NUMERO FACT","NUMERO FACTURA",
-        "F. FACT","FECHA FACT","ESTADO FACT","FACTURADO","FACTURADA","DOC FACT","DOCUMENTO FACT"
-    ])
-    # 2) Por patrón general 'fact' en cualquier columna
-    for c in df.columns:
-        if "fact" in _normtxt(c):
-            if c not in name_hits:
-                name_hits.append(c)
-
-    # 3) Candidatas desde DICCIONARIO (si existe en sesión)
-    try:
-        role_idx = st.session_state.get("role_index") or {}
-        meta_cols = set()
-        for sheet_meta in role_idx.values():
-            for col, meta in (sheet_meta or {}).items():
-                txt = _normtxt(str(meta.get("rol","")) + " " + str(meta.get("descripcion","")))
-                if "fact" in txt and col in df.columns:
-                    meta_cols.add(col)
-        for c in meta_cols:
-            if c not in name_hits:
-                name_hits.append(c)
-    except Exception:
-        pass
-
-    if not name_hits:
-        return pd.Series([True]*len(df))
-
-    # 4) Construye máscara de NO facturado
-    m = pd.Series([False]*len(df))
-    for c in name_hits:
-        s = df[c]
-        # Normaliza a string para evaluar vacíos/pendientes
-        s_norm = s.astype(str).map(_normtxt)
-        # Criterios de "no facturado"
-        m = m | s_norm.isin({"","nan","none","0","no","false"})                 | s_norm.str.contains("pendient|sin|no fact", na=False)
-        # Si es numérico y >0 => facturado; 0 o NaN => no facturado
-        try:
-            snum = pd.to_numeric(s, errors="coerce")
-            m = m | snum.isna() | (snum==0)
-        except Exception:
-            pass
-        # Si parece booleano/flag
-        if str(s.dtype) == "bool":
-            m = m | (~s)
-    return m
-
-def _smart_list_vehicles(question: str, data: dict):
-    q = _normtxt(question)
-    wants_list = any(w in q for w in [
-        "cuales son","cuáles son","cual es","cuál es",
-        "lista","listado","muestrame","muéstrame","mostrar",
-        "detalla","detallar","que vehic","qué vehic","que autos","qué autos",
-        "vehiculos","vehículos","patentes"
-    ])
-    needs_delivered   = "entreg" in q
-    needs_not_invoiced = ("no han sido factur" in q) or ((" no " in f" {q} ") and ("factur" in q)) or ("pendient" in q)
-
-    if not wants_list:
-        return None
-
-    df = data.get("MODELO_BOT")
-    if df is None or df.empty:
-        return None
-
-    mask = pd.Series([True]*len(df))
-    if needs_delivered:   mask = mask & _mask_delivered(df)
-    if needs_not_invoiced: mask = mask & _mask_not_invoiced(df)
-
-    res = df.loc[mask].copy()
-    if res.empty:
-        return {"text": "No encontré vehículos con ese criterio.", "df": pd.DataFrame()}
-
-    cols = _pick_vehicle_cols(res)
-    res  = res[[c for c in cols if c in res.columns]].drop_duplicates().head(200)
-
-    # Mini resumen para la izquierda
-    pat = next((c for c in res.columns if _normtxt(c) in {"patente","placa","matricula","matrícula"}), None)
-    mar = next((c for c in res.columns if _normtxt(c)=="marca"), None)
-    mod = next((c for c in res.columns if _normtxt(c)=="modelo"), None)
-    fe  = next((c for c in res.columns if "entrega" in _normtxt(c)), None)
-
-    preview = []
-    for _, r in res.head(5).iterrows():
-        s = []
-        if pat and r.get(pat): s.append(str(r.get(pat)))
-        if mar and r.get(mar): s.append(str(r.get(mar)))
-        if mod and r.get(mod): s.append(str(r.get(mod)))
-        if fe  and r.get(fe):  s.append(f"entrega: {r.get(fe)}")
-        if s: preview.append(" · ".join(s))
-
-    header  = "### Vehículos encontrados\n"
-    bullets = "\n".join([f"- {x}" for x in preview]) if preview else "- (sin vista previa)"
-    text    = header + bullets + f"\n**Total vehículos**: {len(res)}"
-    return {"text": text, "df": res}
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1945,7 +1785,7 @@ elif ss.menu_sel == "Consulta IA":
                 render_ia_html_block(prettify_answer(raw) + "\n\n" + texto_extra, height=520)
                 _u = st.session_state.get('_last_usage')
                 if _u:
-                    st.caption("")
+                    st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
             with right:
                 render_finance_table(data)
                 st.markdown("### Distribución por cliente y procesos")
@@ -2020,70 +1860,39 @@ elif ss.menu_sel == "Consulta IA":
                 if not found:
                     st.info("No encontré (fecha + monto) para estacionalidad.")
 
-        
-# ------- Responder (junto a la pregunta) -------
-if responder_click and pregunta:
-    # Prepara datos y esquema (si la pregunta trae fechas, filtramos)
-    data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
-    schema = _build_schema(data_filt)
+        # ------- Responder (junto a la pregunta) -------
+        if responder_click and pregunta:
+            data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
+            schema = _build_schema(data_filt)
+            plan_c = plan_compute_from_llm(pregunta, schema)
+            facts = execute_compute(plan_c, data_filt)
 
-    # 1) Intento de listado inteligente (vehículos/OTs) con fallback seguro
-    smart = None
-    try:
-        smart = _smart_list_vehicles(pregunta, data_filt)
-    except Exception as e:
-        st.warning(f"Nota: hubo un problema con el listado inteligente: {e}. Sigo con el método estándar.")
-        smart = None
-
-    if smart is not None:
-        with left:
-            render_ia_html_block(prettify_answer(smart["text"]), height=460)
-            _u = st.session_state.get("_last_usage")
-            if _u:
-                st.caption(
-                    f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, "
-                    f"completion: {_u.get('completion_tokens', '?')}, "
-                    f"total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}"
-                )
-        with right:
-            
-            if isinstance(smart.get("df"), pd.DataFrame) and not smart["df"].empty:
-                st.markdown("#### Resultado (tabla)")
-                df_show = smart["df"].copy()
-                # Sanitiza tipos para Arrow/Streamlit (evita ValueError por objetos complejos)
-                for c in df_show.columns:
-                    if str(df_show[c].dtype) == "object":
-                        try:
-                            df_show[c] = pd.to_datetime(df_show[c], errors="ignore")
-                        except Exception:
-                            pass
-                        df_show[c] = df_show[c].apply(lambda v: v if isinstance(v, (int, float, str, bool, type(None), pd.Timestamp)) else str(v))
-                st.dataframe(df_show, use_container_width=True, height=460)
-
-        st.session_state.historial.append({"pregunta": pregunta, "respuesta": smart["text"]})
-        st.stop()
-
-    # 2) Ruta estándar (plan de cómputo + ejecución)
-    plan_c = plan_compute_from_llm(pregunta, schema)
-    facts = execute_compute(plan_c, data_filt)
-
-    if not facts.get("ok"):
-        with left:
-            st.error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
-            raw = ask_gpt(prompt_consulta_libre(pregunta, schema))
-            render_ia_html_block(raw, height=620)
-            _u = st.session_state.get("_last_usage")
-            if _u:
-                st.caption("")
-        with right:
-            ok = False
-    else:
+            if not facts.get("ok"):
+                with left:
+                    st.error(f"No pude calcular con precisión: {facts.get('msg') or 'plan vacío'}. Uso la ruta de análisis clásico.")
+                raw = ask_gpt(prompt_consulta_libre(pregunta, schema))
+                with left:
+                    render_ia_html_block(raw, height=620)
+                    _u = st.session_state.get("_last_usage")
+                    if _u:
+                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
+                with right:
+                    ok = False
+                    try:
+                        plan = plan_from_llm(pregunta, schema)
+                        ok = execute_plan(plan, data_filt)
+                    except Exception as e:
+                        st.error(f"Error ejecutando plan: {e}")
+                    if not ok:
+                        st.info("Sin visual sugerida para esta consulta.")
+                ss.historial.append({"pregunta":pregunta,"respuesta":raw})
+            else:
                 texto_left = compose_focus_text(facts, pregunta)
                 with left:
                     render_ia_html_block(texto_left, height=520)
                     _u = st.session_state.get("_last_usage")
                     if _u:
-                        st.caption("")
+                        st.caption(f"Uso de tokens — prompt: {_u.get('prompt_tokens', '?')}, completion: {_u.get('completion_tokens', '?')}, total: {_u.get('total_tokens', '?')} · modelo: {_u.get('model', '?')}")
                 with right:
                     df_res = facts["df_result"]
                     if facts.get("category_col"):
@@ -2168,3 +1977,5 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
+
+
