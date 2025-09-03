@@ -2060,7 +2060,7 @@ elif ss.menu_sel == "Consulta IA":
                         if "VALOR" in df_show.columns: df_show.rename(columns={"VALOR":"Valor"}, inplace=True)
                         st.metric(f"{facts.get('op','SUM').upper()} de {facts['value_col']}", fmt_money(df_show['Valor'].iloc[0]) if facts.get("value_role")=='money' and facts.get("op","sum")!="count" else _fmt_number_general(df_show['Valor'].iloc[0]))
                         st.dataframe(df_show, use_container_width=True)
-ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
+                        ss.historial.append({"pregunta":pregunta,"respuesta":texto_left})
 
 elif ss.menu_sel == "Historial":
     if ss.historial:
@@ -2110,5 +2110,4 @@ elif ss.menu_sel == "Diagnóstico IA":
         else: st.info("No se pudo determinar la cuota.")
         if diag["usage_tokens"] is not None: st.caption(f"Tokens: {diag['usage_tokens']}")
         if diag["error"]: st.warning(f"Detalle: {diag['error']}")
-
 
