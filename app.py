@@ -1994,7 +1994,9 @@ elif ss.menu_sel == "Consulta IA":
         if responder_click and pregunta:
             data_filt, _date_meta = filter_data_by_question_if_time(data, pregunta)
             schema = _build_schema(data_filt)
-            plan_c = plan_compute_from_llm(pregunta, schema)
+            plan_c = plan_from_rules(pregunta, schema) or {}
+            if not plan_c.get('value_col'):
+                plan_c = plan_compute_from_llm(pregunta, schema)
             facts = execute_compute(plan_c, data_filt)
 
             if not facts.get("ok"):
