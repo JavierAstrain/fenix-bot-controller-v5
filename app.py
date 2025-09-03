@@ -283,7 +283,8 @@ ss.setdefault("_wkey", 0)
 # ======== Carga de datos ========
 @st.cache_data(show_spinner=False, ttl=300)
 def load_excel(file):
-    return pd.read_excel(file, sheet_name=None)
+    d = pd.read_excel(file, sheet_name=None)
+    return _postprocess_data_sheets(d)
 
 @st.cache_data(show_spinner=False, ttl=300)
 def load_gsheet(json_keyfile: str, sheet_url: str):
@@ -293,7 +294,89 @@ def load_gsheet(json_keyfile: str, sheet_url: str):
     )
     client = gspread.authorize(creds)
     sheet = client.open_by_url(sheet_url)
-    return {ws.title: pd.DataFrame(ws.get_all_records()) for ws in sheet.worksheets()}
+    d = {ws.title: pd.DataFrame(ws.get_all_records()) for ws in sheet.worksheets()}
+    return _postprocess_data_sheets(d)
+
+
+# ======== Post-proceso de carga (filtrado de hojas + DICCIONARIO) ========
+_ALLOWED_SHEETS_DEFAULT = ["MODELO_BOT","FINANZAS","DICCIONARIO"]
+
+def _norm_local(s: str) -> str:
+    return str(s).strip().lower()
+
+def _postprocess_data_sheets(d: dict) -> dict:
+    """
+    - Mantiene SOLO las hojas permitidas (por defecto: MODELO_BOT, FINANZAS, DICCIONARIO)
+    - Ignora RECEPCION / REPARACION / FACTURACION (si vienen en el archivo)
+    - Si existe DICCIONARIO, fuerza roles y alias en ss.roles_forced / ss.aliases
+    - También construye un resumen compacto del diccionario para usarlo en el prompt del sistema
+    """
+    if "roles_forced" not in ss: ss.roles_forced = {}
+    if "aliases" not in ss: ss.aliases = {}
+    try:
+        allowed_raw = (st.secrets.get("ALLOWED_SHEETS") or ",").strip()
+    except Exception:
+        allowed_raw = ","
+    allowed = [x.strip() for x in allowed_raw.split(",") if x.strip()] or _ALLOWED_SHEETS_DEFAULT
+    allowed_norm = {_norm_local(x) for x in allowed}
+
+    out = {}
+    for name, df in (d or {}).items():
+        if _norm_local(name) in allowed_norm:
+            out[name] = df
+
+    # Safety: nunca dejes entrar hojas antiguas aunque estén en el archivo
+    for bad in ["RECEPCION","REPARACION","FACTURACION"]:
+        for k in list(out.keys()):
+            if _norm_local(k) == _norm_local(bad):
+                out.pop(k, None)
+
+    # Procesar DICCIONARIO (si existe)
+    dict_key = None
+    for k in out.keys():
+        if _norm_local(k) == "diccionario":
+            dict_key = k; break
+    if dict_key:
+        try:
+            df = out[dict_key]
+            # Column mapping tolerante
+            cols = { _norm_local(c): c for c in df.columns }
+            c_sheet = cols.get("hoja") or cols.get("sheet")
+            c_field = cols.get("campo") or cols.get("columna") or cols.get("field") or cols.get("nombre")
+            c_role  = cols.get("rol") or cols.get("role")
+            c_desc  = cols.get("descripcion") or cols.get("descripción") or cols.get("description")
+            c_alias = cols.get("alias")
+            c_unit  = cols.get("unidad") or cols.get("unidad_medida") or cols.get("unidad de medida")
+            # Forzar roles/alias
+            if c_field and c_role:
+                for _, row in df.iterrows():
+                    sheet = str(row[c_sheet]).strip() if (c_sheet and (c_sheet in df.columns)) else "MODELO_BOT"
+                    field = row[c_field]
+                    role  = row[c_role]
+                    if field and role and str(role).strip():
+                        ss.roles_forced[ (sheet, _norm(field)) ] = str(role).strip().lower()
+                    if c_alias and (c_alias in df.columns):
+                        alias_val = row[c_alias]
+                        if isinstance(alias_val, str) and alias_val.strip():
+                            ss.aliases[_norm(alias_val)] = str(field)
+            # Resumen compacto para el prompt del sistema
+            small = []
+            take_cols = [x for x in [c_sheet, c_field, c_role, c_unit, c_desc] if x]
+            for _, row in df.head(150).iterrows():
+                item = {}
+                if c_sheet: item["hoja"] = str(row.get(c_sheet, ""))
+                if c_field: item["campo"] = str(row.get(c_field, ""))
+                if c_role:  item["rol"]   = str(row.get(c_role, ""))
+                if c_unit:  item["unidad"]= str(row.get(c_unit, ""))
+                if c_desc:  item["desc"]  = str(row.get(c_desc, ""))[:140]
+                if item: small.append(item)
+            ss._dictionary_hint = json.dumps(small, ensure_ascii=False)[:4000]
+        except Exception as e:
+            ss._dictionary_hint = ""
+    else:
+        ss._dictionary_hint = ""
+
+    return out
 
 # ======== OpenAI ========
 def _get_openai_client():
@@ -1267,9 +1350,14 @@ def compose_market_text(data: Dict[str, Any]) -> str:
 # ======== Prompts LLM ========
 def make_system_prompt():
     today = _now_scl().strftime("%Y-%m-%d")
-    return ("Eres un Controller Financiero senior para un taller de desabolladura y pintura. "
+    base = ("Eres un Controller Financiero senior para un taller de desabolladura y pintura. "
             f"Fecha de hoy (America/Santiago): {today}. "
             "Responde SIEMPRE con estilo ejecutivo + analítico y basándote EXCLUSIVAMENTE en la planilla.")
+    hint = ss.get('_dictionary_hint')
+    if hint:
+        base += "
+Diccionario de columnas (resumen): " + hint
+    return base
 
 ANALYSIS_FORMAT = """
 Escribe SIEMPRE en este formato (usa '###' y bullets '- '):
